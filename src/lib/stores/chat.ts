@@ -13,6 +13,7 @@
 // Provider settings live here too (masked; the raw key never leaves Rust).
 
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { get, writable } from "svelte/store";
 
 import {
@@ -23,7 +24,7 @@ import {
   type ChatEntry,
   type DisplayMessage,
 } from "./chatReducer";
-import { refreshTree, selected } from "./vault";
+import { ensureVisible, fileTree, refreshTree, selected, type TreeNode } from "./vault";
 import { flushOpenEditor, requestEditorReload } from "./editorBridge";
 
 // ---------------------------------------------------------------------------
@@ -205,6 +206,72 @@ export async function revert(revisionId: string): Promise<string> {
   const sel = get(selected);
   if (sel && !sel.isDir && sel.path === path) requestEditorReload();
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// Opening notes (clickable links in chat + the ai-open-note tool event)
+// ---------------------------------------------------------------------------
+
+/** True if `path` is an exact note path in the current tree. */
+function pathInTree(path: string): boolean {
+  const walk = (n: TreeNode): boolean =>
+    (!n.isDir && n.path === path) || n.children.some(walk);
+  const root = get(fileTree);
+  return root ? walk(root) : false;
+}
+
+/** Opens `path` in the editor, expanding ancestors so it's visible. */
+function openNotePath(path: string): void {
+  ensureVisible(path);
+  selected.set({ path, isDir: false });
+}
+
+/** Shows a short-lived muted notice (auto-dismissed), e.g. an unresolved link. */
+function transientNotice(text: string): void {
+  const id = nextId();
+  chatMessages.update((m) => [...m, { kind: "notice", id, text }]);
+  setTimeout(() => {
+    chatMessages.update((m) => m.filter((e) => e.id !== id));
+  }, 3500);
+}
+
+/**
+ * Opens a note referenced by a clickable chat link. Prefers an exact rel-path
+ * hit in the tree; otherwise resolves the bare name (sans `.md`) via the index;
+ * a miss surfaces a transient "note not found" notice rather than a modal.
+ */
+export async function openNoteLink(target: string): Promise<void> {
+  const path = target.replace(/^\.?\//, "");
+  if (pathInTree(path)) {
+    openNotePath(path);
+    return;
+  }
+  const name = (path.split("/").pop() ?? path).replace(/\.md$/i, "");
+  try {
+    const resolved = await invoke<string | null>("resolve_note", { name });
+    if (resolved) {
+      openNotePath(resolved);
+      return;
+    }
+  } catch {
+    // Fall through to the not-found notice.
+  }
+  transientNotice(`Note not found: ${name}`);
+}
+
+let aiOpenNoteUnlisten: UnlistenFn | null = null;
+
+/**
+ * Registers the one-shot listener for the backend `ai-open-note` event (fired
+ * by the `open_note` tool) → opens the note in the editor. Safe to call
+ * repeatedly. Mirrors the listen-once pattern in indexEvents.ts.
+ */
+export async function initAiOpenNote(): Promise<void> {
+  if (aiOpenNoteUnlisten) return;
+  aiOpenNoteUnlisten = await listen<{ path: string }>("ai-open-note", (event) => {
+    const path = event.payload?.path;
+    if (path) openNotePath(path);
+  });
 }
 
 // ---------------------------------------------------------------------------

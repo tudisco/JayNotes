@@ -172,6 +172,49 @@ describe("reduceChat — error + done", () => {
   });
 });
 
+describe("reduceChat — reasoning lifecycle", () => {
+  it("accumulates reasoning before any content into one bubble", () => {
+    const msgs = run(
+      { type: "reasoning", text: "Let me " },
+      { type: "reasoning", text: "think." },
+    );
+    expect(msgs).toHaveLength(1);
+    const a = msgs[0] as AssistantEntry;
+    expect(a.reasoning).toBe("Let me think.");
+    expect(a.text).toBe("");
+    expect(a.streaming).toBe(true);
+  });
+
+  it("keeps reasoning on the bubble as content then streams in", () => {
+    const msgs = run(
+      { type: "reasoning", text: "thinking…" },
+      { type: "token", text: "The " },
+      { type: "token", text: "answer." },
+    );
+    expect(msgs).toHaveLength(1);
+    const a = msgs[0] as AssistantEntry;
+    expect(a.reasoning).toBe("thinking…");
+    expect(a.text).toBe("The answer.");
+  });
+
+  it("seals reasoning + content together on done", () => {
+    const msgs = run(
+      { type: "reasoning", text: "r" },
+      { type: "token", text: "hi" },
+      { type: "done", rounds: 1, cancelled: false },
+    );
+    const a = msgs[0] as AssistantEntry;
+    expect(a.streaming).toBe(false);
+    expect(a.reasoning).toBe("r");
+    expect(a.text).toBe("hi");
+  });
+
+  it("a fresh token-only turn starts with empty reasoning", () => {
+    const msgs = run({ type: "token", text: "hi" });
+    expect((msgs[0] as AssistantEntry).reasoning).toBe("");
+  });
+});
+
 describe("mapHistory", () => {
   it("maps roles into rendered entries and drops empty assistant chatter", () => {
     const entries = mapHistory([
@@ -185,5 +228,16 @@ describe("mapHistory", () => {
     expect(tool.status).toBe("done");
     expect(tool.summary).toBe("Searched — 1 result");
     expect(tool.revisionId).toBeUndefined();
+  });
+
+  it("restores assistant reasoning from history", () => {
+    const entries = mapHistory([
+      { role: "assistant", content: "Done.", reasoning: "I planned it out." },
+    ]);
+    expect(entries).toHaveLength(1);
+    const a = entries[0] as AssistantEntry;
+    expect(a.reasoning).toBe("I planned it out.");
+    expect(a.text).toBe("Done.");
+    expect(a.streaming).toBe(false);
   });
 });

@@ -23,6 +23,7 @@
     QUICK_ACTIONS,
   } from "$lib/stores/chat";
   import MarkdownView from "./chat/MarkdownView.svelte";
+  import ThinkingBlock from "./chat/ThinkingBlock.svelte";
   import ToolChip from "./chat/ToolChip.svelte";
   import PermissionCard from "./chat/PermissionCard.svelte";
   import AiSettingsPanel from "./chat/AiSettingsPanel.svelte";
@@ -190,8 +191,14 @@
             <div class="msg user"><div class="bubble">{entry.text}</div></div>
           {:else if entry.kind === "assistant"}
             <div class="msg assistant" class:streaming={entry.streaming}>
-              <MarkdownView source={entry.text} />
-              {#if entry.streaming}<span class="cursor" aria-hidden="true"></span>{/if}
+              {#if entry.reasoning}
+                <ThinkingBlock
+                  reasoning={entry.reasoning}
+                  active={entry.streaming && !entry.text}
+                />
+              {/if}
+              {#if entry.text}<MarkdownView source={entry.text} />{/if}
+              {#if entry.streaming && entry.text}<span class="cursor" aria-hidden="true"></span>{/if}
             </div>
           {:else if entry.kind === "tool"}
             <ToolChip {entry} />

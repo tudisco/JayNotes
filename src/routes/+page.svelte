@@ -7,6 +7,7 @@
   import ChatSidebar from "$lib/components/ChatSidebar.svelte";
   import { initVault, newNote, vaultError, vaultPath } from "$lib/stores/vault";
   import { initIndexEvents } from "$lib/stores/indexEvents";
+  import { initAiOpenNote } from "$lib/stores/chat";
   import {
     quickSwitcherOpen,
     searchFocusNonce,
@@ -17,6 +18,7 @@
   onMount(() => {
     initVault();
     initIndexEvents();
+    initAiOpenNote();
     window.addEventListener("keydown", onKeydown);
     return () => window.removeEventListener("keydown", onKeydown);
   });

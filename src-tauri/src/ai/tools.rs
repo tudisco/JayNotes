@@ -11,6 +11,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 use tauri::ipc::Channel;
+use tauri::Emitter;
 use walkdir::WalkDir;
 
 use super::revisions::Revisions;
@@ -25,6 +26,9 @@ pub struct ToolContext<'a> {
     pub channel: &'a Channel<AiEvent>,
     pub root: std::path::PathBuf,
     pub revisions: Revisions,
+    /// App handle for firing global UI side-effect events (e.g. `open_note`).
+    /// `None` in unit tests, where emission is a no-op.
+    pub app: Option<tauri::AppHandle>,
 }
 
 /// Result of running one tool.
@@ -113,6 +117,11 @@ pub fn tool_schemas() -> Vec<Value> {
             obj(json!({ "path": { "type": "string" } }), &["path"]),
         ),
         tool(
+            "open_note",
+            "Open a note in the user's editor so they can see it. Use when the user asks to open/show/go to a note.",
+            obj(json!({ "path": { "type": "string" } }), &["path"]),
+        ),
+        tool(
             "create_note",
             "Create a NEW note at the given path with markdown content. Errors if a note already exists there — pick another name. Include YAML frontmatter with tags when appropriate.",
             obj(json!({
@@ -183,8 +192,10 @@ pub fn summarize_args(name: &str, args: &Value) -> String {
     match name {
         "search_notes" => format!("\"{}\"", s("query")),
         "notes_by_tag" => format!("#{}", s("tag")),
-        "read_note" | "note_links" | "create_note" | "update_note" | "append_to_note"
-        | "delete_note" | "delete_folder" | "create_folder" => s("path").to_string(),
+        "read_note" | "note_links" | "open_note" | "create_note" | "update_note"
+        | "append_to_note" | "delete_note" | "delete_folder" | "create_folder" => {
+            s("path").to_string()
+        }
         "rename_note" => format!("{} → {}", s("old_path"), s("new_path")),
         "move_note" | "move_folder" => {
             let dest = s("destination_folder");
@@ -220,6 +231,7 @@ async fn try_dispatch(ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result
         "notes_by_tag" => notes_by_tag(ctx, arg_str(args, "tag")?),
         "read_note" => read_note(ctx, arg_str(args, "path")?),
         "note_links" => note_links(ctx, arg_str(args, "path")?),
+        "open_note" => open_note(ctx, arg_str(args, "path")?),
         "create_note" => create_note(ctx, arg_str(args, "path")?, arg_str(args, "content")?),
         "update_note" => update_note(ctx, arg_str(args, "path")?, arg_str(args, "content")?),
         "append_to_note" => append_to_note(ctx, arg_str(args, "path")?, arg_str(args, "content")?),
@@ -321,6 +333,22 @@ fn note_links(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> 
     let (outgoing, backlinks) = with_index(ctx, |idx| idx.links_for(path))?;
     let summary = format!("{path}: {} out, {} back", outgoing.len(), backlinks.len());
     Ok(ToolOutcome::ok(json!({ "outgoing": outgoing, "backlinks": backlinks }), summary))
+}
+
+/// Ungated: validates that the note exists (vault-jailed), then fires a global
+/// `ai-open-note` app event so the UI opens it in the editor. The chat channel
+/// is for chat events; a global event keeps this UI side effect cleanly
+/// separate. Emission is best-effort and a no-op when no app handle is present
+/// (unit tests).
+fn open_note(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> {
+    let abs = vault::safe_join(&ctx.root, path)?;
+    if !abs.is_file() {
+        return Err(format!("Note does not exist: {path}"));
+    }
+    if let Some(app) = &ctx.app {
+        let _ = app.emit("ai-open-note", json!({ "path": path }));
+    }
+    Ok(ToolOutcome::ok(json!({ "path": path, "opened": true }), format!("Opened {path}")))
 }
 
 // ---- write tools ----
@@ -619,9 +647,9 @@ mod tests {
             .collect();
         for expected in [
             "search_notes", "list_notes", "list_folders", "list_tags", "notes_by_tag",
-            "read_note", "note_links", "create_note", "update_note", "append_to_note",
-            "rename_note", "move_note", "move_folder", "create_folder", "delete_note",
-            "batch_delete", "delete_folder",
+            "read_note", "note_links", "open_note", "create_note", "update_note",
+            "append_to_note", "rename_note", "move_note", "move_folder", "create_folder",
+            "delete_note", "batch_delete", "delete_folder",
         ] {
             assert!(names.contains(&expected.to_string()), "missing schema: {expected}");
         }
@@ -686,6 +714,7 @@ mod tests {
             channel,
             root: root.to_path_buf(),
             revisions: Revisions::new(rev_dir),
+            app: None,
         }
     }
 
@@ -736,6 +765,27 @@ mod tests {
         let ap = dispatch(&ctx, "append_to_note", &json!({"path":"n.md","content":"more"})).await;
         assert!(ap.revision_id.is_some());
         assert_eq!(std::fs::read_to_string(root.join("n.md")).unwrap(), "# Two\nmore");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn open_note_validates_existence() {
+        let root = temp_vault("open");
+        let state = state_with_index(&root, &[]);
+        std::fs::write(root.join("here.md"), "hi").unwrap();
+        let ai = AppAiState::default();
+        let ch = noop_channel();
+        let ctx = ctx_for(&state, &ai, &ch, &root, root.join(".rev"));
+
+        // Existing note → success (event emission is a no-op without an app handle).
+        let ok = dispatch(&ctx, "open_note", &json!({"path":"here.md"})).await;
+        assert!(ok.result.contains("\"opened\":true"), "{}", ok.result);
+        assert_eq!(ok.summary, "Opened here.md");
+
+        // Missing note → error.
+        let miss = dispatch(&ctx, "open_note", &json!({"path":"nope.md"})).await;
+        assert!(miss.result.starts_with("Error:"), "{}", miss.result);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1070,7 +1120,17 @@ mod tests {
         // Round 2: final answer streamed.
         let resp2 = client.stream(&messages, &schemas, true).await.unwrap();
         let mut streamed = String::new();
-        let turn2 = consume_stream(resp2, |t| streamed.push_str(t), &cancel).await.unwrap();
+        let turn2 = consume_stream(
+            resp2,
+            |p| {
+                if let crate::ai::client::StreamPiece::Content(t) = p {
+                    streamed.push_str(&t);
+                }
+            },
+            &cancel,
+        )
+        .await
+        .unwrap();
         assert_eq!(streamed, "Found 1 note.");
         assert_eq!(turn2.content, "Found 1 note.");
         assert!(!turn2.wants_tools());

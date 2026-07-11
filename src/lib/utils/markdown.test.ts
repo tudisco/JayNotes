@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { escapeHtml, renderMarkdown } from "./markdown";
+import { escapeHtml, preprocessNoteLinks, renderMarkdown } from "./markdown";
 
 describe("escapeHtml", () => {
   it("escapes all five significant characters", () => {
@@ -74,5 +74,106 @@ describe("renderMarkdown — safety (raw HTML never survives)", () => {
     expect(html).toContain("&lt;b&gt;");
     expect(html).toContain("bold claim");
     expect(html).not.toMatch(/<b>/);
+  });
+});
+
+describe("renderMarkdown — GFM (tables, task lists, strikethrough)", () => {
+  it("renders a GFM table with header and body cells", () => {
+    const html = renderMarkdown(
+      "| Name | Qty |\n| --- | --- |\n| Apples | 3 |",
+    );
+    expect(html).toContain("<table");
+    expect(html).toContain("<th");
+    expect(html).toContain("<td");
+    expect(html).toContain("Apples");
+  });
+
+  it("renders a task list with checkbox inputs and list items", () => {
+    const html = renderMarkdown("- [x] done\n- [ ] todo");
+    expect(html).toContain("<li");
+    expect(html).toMatch(/<input[^>]*type="checkbox"/);
+    // Task-list checkboxes are display-only.
+    expect(html).toMatch(/<input[^>]*disabled/);
+  });
+
+  it("renders strikethrough", () => {
+    expect(renderMarkdown("~~gone~~")).toContain("<del>gone</del>");
+  });
+
+  it("keeps embedded HTML in a table cell escaped (no reopened hole)", () => {
+    const html = renderMarkdown(
+      "| Col |\n| --- |\n| <img src=x onerror=alert(1)> |",
+    );
+    expect(html).toContain("<table");
+    expect(html).not.toMatch(/<img/i);
+    expect(html).not.toMatch(/<[a-z][^>]*\son\w+=/i);
+    expect(html).toContain("&lt;img");
+  });
+
+  it("keeps a <script> in a table cell escaped", () => {
+    const html = renderMarkdown("| C |\n| --- |\n| <script>alert(1)</script> |");
+    expect(html).not.toMatch(/<script/i);
+    expect(html).toContain("&lt;script");
+  });
+});
+
+describe("preprocessNoteLinks — wikilink rewriting", () => {
+  it("rewrites a bare wikilink to a note link labeled by filename", () => {
+    const html = renderMarkdown("See [[folder/My Note.md]] please");
+    expect(html).toContain('data-note="folder/My Note.md"');
+    expect(html).toContain('class="note-link"');
+    expect(html).toContain(">My Note</a>");
+  });
+
+  it("handles paths with spaces and slashes intact", () => {
+    const html = renderMarkdown("[[a b/c d/Deep Note.md]]");
+    expect(html).toContain('data-note="a b/c d/Deep Note.md"');
+    expect(html).toContain(">Deep Note</a>");
+  });
+
+  it("uses the alias form for the label", () => {
+    const html = renderMarkdown("[[folder/Note.md|Custom Label]]");
+    expect(html).toContain('data-note="folder/Note.md"');
+    expect(html).toContain(">Custom Label</a>");
+  });
+
+  it("leaves wikilinks inside inline code untouched", () => {
+    const out = preprocessNoteLinks("use `[[Note.md]]` literally");
+    expect(out).toBe("use `[[Note.md]]` literally");
+    const html = renderMarkdown("use `[[Note.md]]` literally");
+    expect(html).not.toContain("data-note");
+    expect(html).toContain("[[Note.md]]");
+  });
+
+  it("leaves wikilinks inside fenced code blocks untouched", () => {
+    const src = "```\n[[Secret.md]]\n```";
+    expect(preprocessNoteLinks(src)).toBe(src);
+    expect(renderMarkdown(src)).not.toContain("data-note");
+  });
+
+  it("turns a relative .md markdown link into a note link", () => {
+    const html = renderMarkdown("[read](notes/Todo.md)");
+    expect(html).toContain('data-note="notes/Todo.md"');
+    expect(html).toContain(">read</a>");
+  });
+
+  it("does not treat external links as note links", () => {
+    const html = renderMarkdown("[site](https://example.com/x.md)");
+    expect(html).not.toContain("data-note");
+    expect(html).toContain('href="https://example.com/x.md"');
+  });
+
+  it("stays escaped for a crafted [[<img>]] payload (no XSS)", () => {
+    const html = renderMarkdown("[[<img src=x onerror=alert(1)>]]");
+    expect(html).not.toMatch(/<img/i);
+    expect(html).not.toMatch(/<[a-z][^>]*\son\w+=/i);
+    // The angle-bracketed payload survives only as escaped text.
+    expect(html).toContain("&lt;img");
+  });
+
+  it("escapes a crafted alias so it cannot break out of the link", () => {
+    const html = renderMarkdown("[[Note.md|<img src=x onerror=alert(1)>]]");
+    expect(html).not.toMatch(/<img/i);
+    expect(html).not.toMatch(/<[a-z][^>]*\son\w+=/i);
   });
 });

@@ -16,6 +16,7 @@
 
 export type AiEvent =
   | { type: "token"; text: string }
+  | { type: "reasoning"; text: string }
   | { type: "toolCall"; id: string; name: string; argsSummary: string }
   | {
       type: "toolResult";
@@ -60,6 +61,11 @@ export interface AssistantEntry {
   kind: "assistant";
   id: string;
   text: string;
+  /**
+   * Accumulated model reasoning (chain-of-thought) for this turn, shown in a
+   * collapsed row above the bubble. Empty when the model didn't reason.
+   */
+  reasoning: string;
   /** True while tokens are still streaming into this bubble. */
   streaming: boolean;
 }
@@ -151,7 +157,23 @@ export function reduceChat(messages: ChatEntry[], action: ChatAction): ChatEntry
       }
       return [
         ...messages,
-        { kind: "assistant", id: nextId(), text: action.text, streaming: true },
+        { kind: "assistant", id: nextId(), text: action.text, reasoning: "", streaming: true },
+      ];
+    }
+
+    case "reasoning": {
+      // Reasoning may arrive before any visible content — accumulate it on the
+      // current streaming bubble, or open a fresh (text-empty) one for it.
+      const last = messages[messages.length - 1];
+      if (last && last.kind === "assistant" && last.streaming) {
+        return [
+          ...messages.slice(0, -1),
+          { ...last, reasoning: last.reasoning + action.text },
+        ];
+      }
+      return [
+        ...messages,
+        { kind: "assistant", id: nextId(), text: "", reasoning: action.text, streaming: true },
       ];
     }
 
@@ -230,6 +252,7 @@ export interface DisplayMessage {
   role: "user" | "assistant" | "tool";
   content: string;
   toolCalls?: DisplayToolCall[];
+  reasoning?: string;
 }
 
 /**
@@ -244,8 +267,14 @@ export function mapHistory(history: DisplayMessage[]): ChatEntry[] {
     if (m.role === "user") {
       out.push({ kind: "user", id: nextId(), text: m.content });
     } else if (m.role === "assistant") {
-      if (m.content.trim()) {
-        out.push({ kind: "assistant", id: nextId(), text: m.content, streaming: false });
+      if (m.content.trim() || m.reasoning) {
+        out.push({
+          kind: "assistant",
+          id: nextId(),
+          text: m.content,
+          reasoning: m.reasoning ?? "",
+          streaming: false,
+        });
       }
     } else if (m.role === "tool") {
       out.push({

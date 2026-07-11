@@ -7,11 +7,22 @@
 -->
 <script lang="ts">
   import { renderMarkdown } from "$lib/utils/markdown";
+  import { openNoteLink } from "$lib/stores/chat";
 
   let { source }: { source: string } = $props();
 
   let container = $state<HTMLDivElement>();
   let html = $derived(renderMarkdown(source));
+
+  // Delegated handler: clicking an internal note link opens the note.
+  function onClick(event: MouseEvent): void {
+    const target = event.target as HTMLElement | null;
+    const anchor = target?.closest?.("a[data-note]") as HTMLElement | null;
+    if (!anchor) return;
+    event.preventDefault();
+    const path = anchor.getAttribute("data-note");
+    if (path) void openNoteLink(path);
+  }
 
   // Enhance code blocks with a copy button after every (re)render.
   $effect(() => {
@@ -36,7 +47,8 @@
   });
 </script>
 
-<div class="md" bind:this={container}>{@html html}</div>
+<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+<div class="md" bind:this={container} onclick={onClick}>{@html html}</div>
 
 <style>
   .md {
@@ -70,15 +82,16 @@
     font-weight: 600;
     line-height: 1.3;
   }
+  /* Kept modest — headings shouldn't shout in a narrow chat column. */
   .md :global(h1) {
-    font-size: 17px;
+    font-size: 1.15em;
   }
   .md :global(h2) {
-    font-size: 15px;
+    font-size: 1.08em;
   }
   .md :global(h3),
   .md :global(h4) {
-    font-size: 14px;
+    font-size: 1em;
   }
   .md :global(ul),
   .md :global(ol) {
@@ -87,12 +100,35 @@
   .md :global(li) {
     margin: 2px 0;
   }
+  /* GFM task lists: drop the bullet, keep the (disabled) checkbox aligned. */
+  .md :global(li:has(> input[type="checkbox"])) {
+    list-style: none;
+    margin-left: -16px;
+  }
+  .md :global(li > input[type="checkbox"]) {
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .md :global(del) {
+    color: var(--text-muted);
+  }
   .md :global(a) {
     color: var(--accent);
     text-decoration: none;
   }
   .md :global(a:hover) {
     text-decoration: underline;
+  }
+  /* Internal note links (from [[wikilinks]] and relative .md links). */
+  .md :global(a.note-link) {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px dotted color-mix(in srgb, var(--accent) 55%, transparent);
+    cursor: pointer;
+  }
+  .md :global(a.note-link:hover) {
+    border-bottom-style: solid;
+    text-decoration: none;
   }
   .md :global(code) {
     padding: 1px 4px;
@@ -124,7 +160,12 @@
     max-width: 100%;
     border-radius: 6px;
   }
+  /* Tables scroll horizontally rather than forcing the panel to widen. */
   .md :global(table) {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
     border-collapse: collapse;
     font-size: 12px;
   }
@@ -132,6 +173,11 @@
   .md :global(td) {
     padding: 4px 8px;
     border: 1px solid var(--border);
+    text-align: left;
+  }
+  .md :global(thead th) {
+    background-color: var(--hover);
+    font-weight: 600;
   }
   .md :global(hr) {
     border: none;

@@ -114,6 +114,12 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Separate reasoning channel, MiniMax / DeepSeek style.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// Separate reasoning channel, OpenRouter style.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCallDelta>,
 }
@@ -191,6 +197,115 @@ impl SseParser {
 }
 
 // ---------------------------------------------------------------------------
+// Reasoning vs. content splitting
+// ---------------------------------------------------------------------------
+
+/// A piece of streamed assistant output. Reasoning (a model's private thinking)
+/// is surfaced separately so the UI can collapse it and — crucially — so it is
+/// never folded into the assistant `content` that gets sent back to the API on
+/// later turns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamPiece {
+    /// Visible assistant text.
+    Content(String),
+    /// Model reasoning / chain-of-thought (display only).
+    Reasoning(String),
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// State of the inline `<think>…</think>` splitter (see [`ThinkSplitter`]).
+#[derive(Default, Debug, PartialEq, Eq)]
+enum ThinkState {
+    /// Start of the content stream: still deciding whether it opens with a
+    /// `<think>` tag.
+    #[default]
+    Start,
+    /// Inside a `<think>` block: text routes to reasoning until `</think>`.
+    InThink,
+    /// Past any leading think block: everything is visible content (a later
+    /// `<think>` mid-stream is treated as literal text).
+    Normal,
+}
+
+/// Splits a `delta.content` stream that carries reasoning inline as
+/// `<think>…</think>` tags at its very start. Tags may be split across chunks,
+/// so a conservative buffer holds back any suffix that could still grow into a
+/// tag. Providers that use a separate `reasoning_content`/`reasoning` field
+/// never reach here — this only handles the tag-in-content shape.
+#[derive(Default)]
+struct ThinkSplitter {
+    state: ThinkState,
+    /// Bytes not yet classified (a possible partial tag).
+    buf: String,
+}
+
+impl ThinkSplitter {
+    /// Feeds a content delta, pushing classified pieces onto `out`.
+    fn feed(&mut self, text: &str, out: &mut Vec<StreamPiece>) {
+        self.buf.push_str(text);
+        loop {
+            match self.state {
+                ThinkState::Start => {
+                    let trimmed = self.buf.trim_start();
+                    let lead = self.buf.len() - trimmed.len();
+                    if trimmed.is_empty() {
+                        return; // only whitespace so far — wait for more
+                    }
+                    if trimmed.len() < THINK_OPEN.len() {
+                        if THINK_OPEN.starts_with(trimmed) {
+                            return; // could still become `<think>` — keep buffering
+                        }
+                        self.state = ThinkState::Normal; // definitely not a think block
+                    } else if trimmed.starts_with(THINK_OPEN) {
+                        self.buf.drain(..lead + THINK_OPEN.len());
+                        self.state = ThinkState::InThink;
+                    } else {
+                        self.state = ThinkState::Normal;
+                    }
+                }
+                ThinkState::InThink => {
+                    if let Some(i) = self.buf.find(THINK_CLOSE) {
+                        let reasoning: String = self.buf.drain(..i).collect();
+                        self.buf.drain(..THINK_CLOSE.len());
+                        if !reasoning.is_empty() {
+                            out.push(StreamPiece::Reasoning(reasoning));
+                        }
+                        self.state = ThinkState::Normal;
+                    } else {
+                        // Emit all but a suffix that might be a partial `</think>`.
+                        let keep = partial_suffix_len(&self.buf, THINK_CLOSE);
+                        let emit = self.buf.len() - keep;
+                        if emit > 0 {
+                            let reasoning: String = self.buf.drain(..emit).collect();
+                            out.push(StreamPiece::Reasoning(reasoning));
+                        }
+                        return;
+                    }
+                }
+                ThinkState::Normal => {
+                    if !self.buf.is_empty() {
+                        out.push(StreamPiece::Content(std::mem::take(&mut self.buf)));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Longest `k` (`0 < k < tag.len()`) such that `buf` ends with `tag[..k]` — the
+/// length of a trailing partial-tag suffix to hold back. `tag` is ASCII.
+fn partial_suffix_len(buf: &str, tag: &str) -> usize {
+    let max = tag.len().saturating_sub(1).min(buf.len());
+    (1..=max)
+        .rev()
+        .find(|&k| buf.as_bytes().ends_with(tag[..k].as_bytes()))
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // Delta accumulator
 // ---------------------------------------------------------------------------
 
@@ -208,6 +323,10 @@ struct ToolCallBuilder {
 #[derive(Default)]
 pub struct StreamAccumulator {
     content: String,
+    /// Accumulated reasoning text (display only; never sent back to the API).
+    reasoning: String,
+    /// Splits inline `<think>…</think>` reasoning out of the content stream.
+    think: ThinkSplitter,
     /// Tool calls keyed by their streamed `index`, so out-of-order fragments
     /// and multiple parallel calls all land in the right slot.
     tool_calls: BTreeMap<usize, ToolCallBuilder>,
@@ -225,10 +344,11 @@ impl StreamAccumulator {
         self.done
     }
 
-    /// Ingests one SSE `data:` payload. Returns any content token text carried
-    /// by this payload (usually 0 or 1 string). `[DONE]` marks completion.
-    /// Unparseable payloads are ignored (defensive against provider noise).
-    pub fn ingest(&mut self, payload: &str) -> Vec<String> {
+    /// Ingests one SSE `data:` payload, returning the classified pieces
+    /// (content and/or reasoning) it carried, in order. `[DONE]` marks
+    /// completion. Unparseable payloads are ignored (defensive against provider
+    /// noise).
+    pub fn ingest(&mut self, payload: &str) -> Vec<StreamPiece> {
         let payload = payload.trim();
         if payload.is_empty() {
             return Vec::new();
@@ -241,15 +361,33 @@ impl StreamAccumulator {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        let mut tokens = Vec::new();
+        let mut pieces = Vec::new();
         for choice in chunk.choices {
             if let Some(reason) = choice.finish_reason {
                 self.finish_reason = Some(reason);
             }
+            // Separate reasoning channels (MiniMax/DeepSeek, OpenRouter) arrive
+            // before content and are unconditionally reasoning.
+            for r in [choice.delta.reasoning_content, choice.delta.reasoning]
+                .into_iter()
+                .flatten()
+            {
+                if !r.is_empty() {
+                    self.reasoning.push_str(&r);
+                    pieces.push(StreamPiece::Reasoning(r));
+                }
+            }
             if let Some(text) = choice.delta.content {
                 if !text.is_empty() {
-                    self.content.push_str(&text);
-                    tokens.push(text);
+                    let mut split = Vec::new();
+                    self.think.feed(&text, &mut split);
+                    for piece in split {
+                        match &piece {
+                            StreamPiece::Content(c) => self.content.push_str(c),
+                            StreamPiece::Reasoning(r) => self.reasoning.push_str(r),
+                        }
+                        pieces.push(piece);
+                    }
                 }
             }
             for tc in choice.delta.tool_calls {
@@ -271,7 +409,7 @@ impl StreamAccumulator {
                 }
             }
         }
-        tokens
+        pieces
     }
 
     /// Consumes the accumulator into a finished turn.
@@ -296,6 +434,7 @@ impl StreamAccumulator {
             .collect();
         FinishedTurn {
             content: self.content,
+            reasoning: self.reasoning,
             tool_calls,
             finish_reason: self.finish_reason,
             cancelled: false,
@@ -307,6 +446,8 @@ impl StreamAccumulator {
 #[derive(Debug, Clone)]
 pub struct FinishedTurn {
     pub content: String,
+    /// Accumulated reasoning text (display only; never sent back to the API).
+    pub reasoning: String,
     pub tool_calls: Vec<ApiToolCall>,
     pub finish_reason: Option<String>,
     pub cancelled: bool,
@@ -462,13 +603,13 @@ fn parse_model_ids(json: &Value) -> Option<Vec<String>> {
     Some(ids)
 }
 
-/// Reads a streamed response to completion, invoking `on_token` for each
-/// content token as it arrives and stitching tool-call deltas together. Aborts
-/// promptly (leaving `cancelled = true` and preserving partial content) when
-/// `cancel` is notified.
-pub async fn consume_stream<F: FnMut(&str)>(
+/// Reads a streamed response to completion, invoking `on_piece` for each
+/// classified piece (content or reasoning) as it arrives and stitching
+/// tool-call deltas together. Aborts promptly (leaving `cancelled = true` and
+/// preserving partial content) when `cancel` is notified.
+pub async fn consume_stream<F: FnMut(StreamPiece)>(
     mut resp: reqwest::Response,
-    mut on_token: F,
+    mut on_piece: F,
     cancel: &Notify,
 ) -> Result<FinishedTurn, String> {
     let mut parser = SseParser::new();
@@ -485,8 +626,8 @@ pub async fn consume_stream<F: FnMut(&str)>(
                 match chunk {
                     Ok(Some(bytes)) => {
                         for payload in parser.push(&bytes) {
-                            for tok in acc.ingest(&payload) {
-                                on_token(&tok);
+                            for piece in acc.ingest(&payload) {
+                                on_piece(piece);
                             }
                         }
                         if acc.is_done() {
@@ -515,15 +656,37 @@ mod tests {
     use super::*;
 
     /// Runs raw SSE text through the parser + accumulator, returning the emitted
-    /// content tokens and the finished turn.
-    fn drive(sse: &[u8]) -> (Vec<String>, FinishedTurn) {
+    /// pieces and the finished turn.
+    fn drive(sse: &[u8]) -> (Vec<StreamPiece>, FinishedTurn) {
         let mut parser = SseParser::new();
         let mut acc = StreamAccumulator::new();
-        let mut tokens = Vec::new();
+        let mut pieces = Vec::new();
         for payload in parser.push(sse) {
-            tokens.extend(acc.ingest(&payload));
+            pieces.extend(acc.ingest(&payload));
         }
-        (tokens, acc.finish())
+        (pieces, acc.finish())
+    }
+
+    /// Just the visible-content strings from a piece stream.
+    fn contents(pieces: &[StreamPiece]) -> Vec<String> {
+        pieces
+            .iter()
+            .filter_map(|p| match p {
+                StreamPiece::Content(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Just the reasoning strings from a piece stream.
+    fn reasonings(pieces: &[StreamPiece]) -> Vec<String> {
+        pieces
+            .iter()
+            .filter_map(|p| match p {
+                StreamPiece::Reasoning(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -534,12 +697,100 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let (tokens, turn) = drive(sse.as_bytes());
-        assert_eq!(tokens, vec!["Hello", ", world"]);
+        let (pieces, turn) = drive(sse.as_bytes());
+        assert_eq!(contents(&pieces), vec!["Hello", ", world"]);
+        assert!(reasonings(&pieces).is_empty());
         assert_eq!(turn.content, "Hello, world");
+        assert!(turn.reasoning.is_empty());
         assert_eq!(turn.finish_reason.as_deref(), Some("stop"));
         assert!(turn.tool_calls.is_empty());
         assert!(!turn.wants_tools());
+    }
+
+    #[test]
+    fn reasoning_content_field_routes_to_reasoning() {
+        // MiniMax / DeepSeek shape: a separate `reasoning_content` delta stream,
+        // then the visible answer in `content`.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Answer.\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (pieces, turn) = drive(sse.as_bytes());
+        assert_eq!(reasonings(&pieces), vec!["Let me ", "think."]);
+        assert_eq!(contents(&pieces), vec!["Answer."]);
+        assert_eq!(turn.reasoning, "Let me think.");
+        assert_eq!(turn.content, "Answer.");
+    }
+
+    #[test]
+    fn reasoning_field_openrouter_shape_routes_to_reasoning() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"hmm\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (pieces, turn) = drive(sse.as_bytes());
+        assert_eq!(reasonings(&pieces), vec!["hmm"]);
+        assert_eq!(turn.content, "Hi");
+        assert_eq!(turn.reasoning, "hmm");
+    }
+
+    #[test]
+    fn think_tags_inline_split_reasoning_from_content() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>reasoning here</think>visible\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (pieces, turn) = drive(sse.as_bytes());
+        assert_eq!(reasonings(&pieces), vec!["reasoning here"]);
+        assert_eq!(contents(&pieces), vec!["visible"]);
+        assert_eq!(turn.reasoning, "reasoning here");
+        assert_eq!(turn.content, "visible");
+    }
+
+    #[test]
+    fn think_tags_split_across_chunk_boundaries() {
+        // Open tag, close tag, AND content all split mid-token across chunks.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<thi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"nk>deep \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"thoughts</thi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"nk>the answer\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (pieces, turn) = drive(sse.as_bytes());
+        assert_eq!(turn.reasoning, "deep thoughts");
+        assert_eq!(turn.content, "the answer");
+        // No partial tag ever leaked into either channel.
+        assert!(!contents(&pieces).join("").contains('<'));
+        assert!(!reasonings(&pieces).join("").contains('<'));
+    }
+
+    #[test]
+    fn think_tag_only_no_content() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>just thinking</think>\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (_, turn) = drive(sse.as_bytes());
+        assert_eq!(turn.reasoning, "just thinking");
+        assert_eq!(turn.content, "");
+    }
+
+    #[test]
+    fn think_tag_mid_content_is_literal_text() {
+        // A `<think>` that appears after real content has begun is NOT a
+        // reasoning delimiter — it stays as visible text.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"real text \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>not reasoning</think>\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (_, turn) = drive(sse.as_bytes());
+        assert!(turn.reasoning.is_empty());
+        assert_eq!(turn.content, "real text <think>not reasoning</think>");
     }
 
     #[test]
@@ -552,8 +803,8 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let (tokens, turn) = drive(sse.as_bytes());
-        assert!(tokens.is_empty());
+        let (pieces, turn) = drive(sse.as_bytes());
+        assert!(contents(&pieces).is_empty());
         assert!(turn.wants_tools());
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].id, "call_a");
@@ -584,14 +835,14 @@ mod tests {
         let mut acc = StreamAccumulator::new();
         let full = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
         let (a, b) = full.as_bytes().split_at(20);
-        let mut toks = Vec::new();
+        let mut pieces = Vec::new();
         for p in parser.push(a) {
-            toks.extend(acc.ingest(&p));
+            pieces.extend(acc.ingest(&p));
         }
         for p in parser.push(b) {
-            toks.extend(acc.ingest(&p));
+            pieces.extend(acc.ingest(&p));
         }
-        assert_eq!(toks, vec!["Hi"]);
+        assert_eq!(pieces, vec![StreamPiece::Content("Hi".into())]);
     }
 
     #[test]
@@ -602,8 +853,8 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let (tokens, turn) = drive(sse.as_bytes());
-        assert_eq!(tokens, vec!["ok"]);
+        let (pieces, turn) = drive(sse.as_bytes());
+        assert_eq!(contents(&pieces), vec!["ok"]);
         assert_eq!(turn.content, "ok");
     }
 
