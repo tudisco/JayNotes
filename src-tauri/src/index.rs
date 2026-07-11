@@ -1109,6 +1109,52 @@ impl Index {
         Ok(hits)
     }
 
+    /// Returns `(outgoing, backlinks)` for a note at `rel`.
+    ///
+    /// `outgoing` is this note's `[[wikilinks]]` resolved to existing note
+    /// paths (unresolved targets are dropped). `backlinks` are the paths of
+    /// other notes whose wikilinks resolve to `rel`. Both are deduped and
+    /// sorted. Powers the AI `note_links` tool.
+    pub fn links_for(&self, rel: &str) -> Result<(Vec<String>, Vec<String>), String> {
+        // Every (source_path, target_path) pair in the vault.
+        let pairs: Vec<(String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT n.path, l.target_path FROM links l JOIN notes n ON n.id = l.source_id",
+                )
+                .map_err(|e| format!("Could not prepare links query: {e}"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| format!("Could not query links: {e}"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut outgoing: Vec<String> = Vec::new();
+        let mut back: Vec<String> = Vec::new();
+        let mut seen_out: HashSet<String> = HashSet::new();
+        let mut seen_back: HashSet<String> = HashSet::new();
+        for (source, target) in &pairs {
+            if source == rel {
+                if let Some(resolved) = self.resolve(target)? {
+                    if resolved != rel && seen_out.insert(resolved.clone()) {
+                        outgoing.push(resolved);
+                    }
+                }
+            }
+            if source != rel {
+                if let Some(resolved) = self.resolve(target)? {
+                    if resolved == rel && seen_back.insert(source.clone()) {
+                        back.push(source.clone());
+                    }
+                }
+            }
+        }
+        outgoing.sort();
+        back.sort();
+        Ok((outgoing, back))
+    }
+
     /// Reads `(mtime_secs, size)` for a vault-relative note, if it exists.
     fn stat(&self, rel: &str) -> Option<(i64, i64)> {
         let abs = self.vault_root.join(rel);
@@ -1136,7 +1182,7 @@ fn now_secs() -> i64 {
 
 /// FNV-1a 64-bit hash of a string, hex-encoded. Stable across runs so a vault
 /// always maps to the same db filename.
-fn hash_path(p: &str) -> String {
+pub(crate) fn hash_path(p: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in p.bytes() {
         h ^= b as u64;

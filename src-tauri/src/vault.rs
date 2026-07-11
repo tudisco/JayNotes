@@ -54,7 +54,7 @@ fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join(SETTINGS_FILE))
 }
 
-fn load_settings(app: &tauri::AppHandle) -> Result<Settings, String> {
+pub(crate) fn load_settings(app: &tauri::AppHandle) -> Result<Settings, String> {
     let path = settings_path(app)?;
     if !path.exists() {
         return Ok(Settings::default());
@@ -64,7 +64,7 @@ fn load_settings(app: &tauri::AppHandle) -> Result<Settings, String> {
     serde_json::from_str(&raw).map_err(|e| format!("Settings file is not valid JSON: {e}"))
 }
 
-fn save_settings(app: &tauri::AppHandle, settings: &Settings) -> Result<(), String> {
+pub(crate) fn save_settings(app: &tauri::AppHandle, settings: &Settings) -> Result<(), String> {
     let path = settings_path(app)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -77,7 +77,7 @@ fn save_settings(app: &tauri::AppHandle, settings: &Settings) -> Result<(), Stri
 
 /// Returns the canonicalized vault root, erroring if no vault is configured
 /// or the directory no longer exists.
-fn vault_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn vault_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let settings = load_settings(app)?;
     let raw = settings
         .vault_path
@@ -111,7 +111,7 @@ pub fn saved_vault_root(app: &tauri::AppHandle) -> Option<String> {
 /// Joins `rel` onto `root`, rejecting absolute paths and any path component
 /// that is not a plain name (`..`, drive prefixes, root dirs). `.` components
 /// and an empty string (meaning the root itself) are allowed.
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return Err(format!("Absolute paths are not allowed: {rel}"));
@@ -129,7 +129,7 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
 
 /// Converts an absolute path inside the vault back to a forward-slash
 /// relative path.
-fn to_rel_string(root: &Path, abs: &Path) -> Result<String, String> {
+pub(crate) fn to_rel_string(root: &Path, abs: &Path) -> Result<String, String> {
     let rel = abs
         .strip_prefix(root)
         .map_err(|_| format!("Path is outside the vault: {}", abs.display()))?;
@@ -332,16 +332,7 @@ pub async fn write_note(
     content: String,
 ) -> Result<(), String> {
     let root = vault_root(&app)?;
-    let path = safe_join(&root, &rel_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Could not create parent folders: {e}"))?;
-    }
-    // Register the write BEFORE it lands so the watcher never races us.
-    register_write(&state.recent_writes, &rel_path);
-    fs::write(&path, &content).map_err(|e| format!("Could not write note '{rel_path}': {e}"))?;
-    index_upsert(&state, &rel_path, &content);
-    Ok(())
+    write_note_at(&root, &state, &rel_path, &content)
 }
 
 /// Creates an empty note. If `rel_path` is an existing directory (or empty,
@@ -378,14 +369,8 @@ pub async fn create_note(
         path
     };
 
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Could not create parent folders: {e}"))?;
-    }
     let created_rel = to_rel_string(&root, &file_path)?;
-    register_write(&state.recent_writes, &created_rel);
-    fs::write(&file_path, "").map_err(|e| format!("Could not create note: {e}"))?;
-    index_upsert(&state, &created_rel, "");
+    write_note_at(&root, &state, &created_rel, "")?;
     Ok(created_rel)
 }
 
@@ -393,14 +378,7 @@ pub async fn create_note(
 #[tauri::command]
 pub async fn create_folder(app: tauri::AppHandle, rel_path: String) -> Result<(), String> {
     let root = vault_root(&app)?;
-    if rel_path.is_empty() {
-        return Err("Folder name cannot be empty".to_string());
-    }
-    let path = safe_join(&root, &rel_path)?;
-    if path.exists() {
-        return Err(format!("'{rel_path}' already exists"));
-    }
-    fs::create_dir_all(&path).map_err(|e| format!("Could not create folder '{rel_path}': {e}"))
+    create_folder_at(&root, &rel_path)
 }
 
 /// Renames/moves a file or folder within the vault. Errors if the target
@@ -413,28 +391,7 @@ pub async fn rename_path(
     new_rel: String,
 ) -> Result<(), String> {
     let root = vault_root(&app)?;
-    let old_path = safe_join(&root, &old_rel)?;
-    let new_path = safe_join(&root, &new_rel)?;
-    if !old_path.exists() {
-        return Err(format!("'{old_rel}' does not exist"));
-    }
-    if new_path.exists() {
-        return Err(format!("'{new_rel}' already exists"));
-    }
-    if let Some(parent) = new_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Could not create parent folders: {e}"))?;
-    }
-    register_write(&state.recent_writes, &old_rel);
-    register_write(&state.recent_writes, &new_rel);
-    fs::rename(&old_path, &new_path)
-        .map_err(|e| format!("Could not rename '{old_rel}' to '{new_rel}': {e}"))?;
-    if let Ok(guard) = state.index.lock() {
-        if let Some(idx) = guard.as_ref() {
-            let _ = idx.rename(&old_rel, &new_rel);
-        }
-    }
-    Ok(())
+    rename_at(&root, &state, &old_rel, &new_rel)
 }
 
 /// Moves a file or folder to the OS Trash. Never hard-deletes.
@@ -445,23 +402,7 @@ pub async fn trash_path(
     rel_path: String,
 ) -> Result<(), String> {
     let root = vault_root(&app)?;
-    let path = safe_join(&root, &rel_path)?;
-    if !path.exists() {
-        return Err(format!("'{rel_path}' does not exist"));
-    }
-    let was_dir = path.is_dir();
-    register_write(&state.recent_writes, &rel_path);
-    trash::delete(&path).map_err(|e| format!("Could not move '{rel_path}' to Trash: {e}"))?;
-    if let Ok(guard) = state.index.lock() {
-        if let Some(idx) = guard.as_ref() {
-            let _ = if was_dir {
-                idx.remove_prefix(&rel_path)
-            } else {
-                idx.remove_file(&rel_path)
-            };
-        }
-    }
-    Ok(())
+    trash_at(&root, &state, &rel_path)
 }
 
 /// Resolves a `[[wikilink]]` target `name` to an existing note's relative path
@@ -501,13 +442,7 @@ pub async fn resolve_or_create_note(
     let path = safe_join(&root, &rel)?;
     // If a same-named file exists but wasn't indexed yet, just open it.
     if !path.exists() {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Could not create parent folders: {e}"))?;
-        }
-        register_write(&state.recent_writes, &rel);
-        fs::write(&path, "").map_err(|e| format!("Could not create note: {e}"))?;
-        index_upsert(&state, &rel, "");
+        write_note_at(&root, &state, &rel, "")?;
     }
     Ok(rel)
 }
@@ -649,12 +584,173 @@ pub async fn reveal_in_finder(app: tauri::AppHandle, rel_path: String) -> Result
 
 /// Upserts a single note into the search index, if one is open. Best-effort:
 /// an indexing failure never fails the underlying file operation.
-fn index_upsert(state: &tauri::State<'_, AppState>, rel: &str, content: &str) {
+pub(crate) fn index_upsert(state: &AppState, rel: &str, content: &str) {
     if let Ok(guard) = state.index.lock() {
         if let Some(idx) = guard.as_ref() {
             let _ = idx.index_file(rel, content);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reusable write cores
+//
+// These operate on an already-resolved vault `root` and a plain `&AppState`,
+// so both the `#[tauri::command]` wrappers below and the AI tool dispatcher
+// (`crate::ai::tools`) share one implementation of every mutating file op —
+// each registers a self-write and keeps the search index fresh, exactly like
+// the commands always did.
+// ---------------------------------------------------------------------------
+
+/// Writes `content` to `rel` (creating parent folders), registering the write
+/// and reindexing. Full-replace semantics.
+pub(crate) fn write_note_at(
+    root: &Path,
+    state: &AppState,
+    rel: &str,
+    content: &str,
+) -> Result<(), String> {
+    let path = safe_join(root, rel)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not create parent folders: {e}"))?;
+    }
+    register_write(&state.recent_writes, rel);
+    fs::write(&path, content).map_err(|e| format!("Could not write note '{rel}': {e}"))?;
+    index_upsert(state, rel, content);
+    Ok(())
+}
+
+/// Creates a new note at the exact `rel` path with `content`. Appends `.md`
+/// when the caller omitted it. Errors if the file already exists. Returns the
+/// final relative path.
+pub(crate) fn create_note_exact(
+    root: &Path,
+    state: &AppState,
+    rel: &str,
+    content: &str,
+) -> Result<String, String> {
+    if rel.trim().is_empty() {
+        return Err("A note path is required".to_string());
+    }
+    let mut path = safe_join(root, rel)?;
+    if !is_markdown(&path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| format!("Invalid note path: {rel}"))?;
+        path.set_file_name(format!("{name}.md"));
+    }
+    if path.exists() {
+        return Err(format!(
+            "A file named '{}' already exists — pick another name",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not create parent folders: {e}"))?;
+    }
+    let created_rel = to_rel_string(root, &path)?;
+    register_write(&state.recent_writes, &created_rel);
+    fs::write(&path, content).map_err(|e| format!("Could not create note '{created_rel}': {e}"))?;
+    index_upsert(state, &created_rel, content);
+    Ok(created_rel)
+}
+
+/// Creates a folder (and any missing parents) at `rel`. Errors if it exists.
+pub(crate) fn create_folder_at(root: &Path, rel: &str) -> Result<(), String> {
+    if rel.trim().is_empty() {
+        return Err("Folder name cannot be empty".to_string());
+    }
+    let path = safe_join(root, rel)?;
+    if path.exists() {
+        return Err(format!("'{rel}' already exists"));
+    }
+    fs::create_dir_all(&path).map_err(|e| format!("Could not create folder '{rel}': {e}"))
+}
+
+/// Renames/moves `old_rel` to `new_rel` within the vault, registering both
+/// writes and updating the index. Errors if the source is missing or the
+/// target already exists.
+pub(crate) fn rename_at(
+    root: &Path,
+    state: &AppState,
+    old_rel: &str,
+    new_rel: &str,
+) -> Result<(), String> {
+    let old_path = safe_join(root, old_rel)?;
+    let new_path = safe_join(root, new_rel)?;
+    if !old_path.exists() {
+        return Err(format!("'{old_rel}' does not exist"));
+    }
+    if new_path.exists() {
+        return Err(format!("'{new_rel}' already exists"));
+    }
+    if let Some(parent) = new_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not create parent folders: {e}"))?;
+    }
+    register_write(&state.recent_writes, old_rel);
+    register_write(&state.recent_writes, new_rel);
+    fs::rename(&old_path, &new_path)
+        .map_err(|e| format!("Could not rename '{old_rel}' to '{new_rel}': {e}"))?;
+    if let Ok(guard) = state.index.lock() {
+        if let Some(idx) = guard.as_ref() {
+            let _ = idx.rename(old_rel, new_rel);
+        }
+    }
+    Ok(())
+}
+
+/// Moves `rel` to the OS Trash (or, under `cfg(test)`, to a `.trash/` folder in
+/// the vault so tests can assert removal without touching the real Trash),
+/// registering the write and pruning the index. Never hard-deletes.
+pub(crate) fn trash_at(root: &Path, state: &AppState, rel: &str) -> Result<(), String> {
+    let path = safe_join(root, rel)?;
+    if !path.exists() {
+        return Err(format!("'{rel}' does not exist"));
+    }
+    let was_dir = path.is_dir();
+    register_write(&state.recent_writes, rel);
+    move_to_trash(root, &path).map_err(|e| format!("Could not move '{rel}' to Trash: {e}"))?;
+    if let Ok(guard) = state.index.lock() {
+        if let Some(idx) = guard.as_ref() {
+            let _ = if was_dir {
+                idx.remove_prefix(rel)
+            } else {
+                idx.remove_file(rel)
+            };
+        }
+    }
+    Ok(())
+}
+
+/// The terminal "send to Trash" step, wrapped so tests are deterministic. In a
+/// normal build it delegates to the `trash` crate (real OS Trash). Under test
+/// it relocates the file into a hidden `.trash/` directory inside the vault —
+/// which the scanner ignores — so a test can verify the file left the vault
+/// tree without polluting the developer's actual Trash.
+#[cfg(not(test))]
+fn move_to_trash(_root: &Path, abs: &Path) -> Result<(), String> {
+    trash::delete(abs).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+fn move_to_trash(root: &Path, abs: &Path) -> Result<(), String> {
+    let trash_dir = root.join(".trash");
+    fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
+    let name = abs
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "trashed".into());
+    let mut dest = trash_dir.join(&name);
+    let mut n = 1;
+    while dest.exists() {
+        dest = trash_dir.join(format!("{}-{n}", name.to_string_lossy()));
+        n += 1;
+    }
+    fs::rename(abs, &dest).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
