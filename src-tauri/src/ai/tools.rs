@@ -1,34 +1,54 @@
 //! Tool schemas and the dispatcher that executes them against the vault.
 //!
-//! Every mutating tool goes through the shared cores in [`crate::vault`] (so it
-//! registers a self-write and keeps the search index fresh, exactly like the
-//! hand-driven commands) and every path is jailed by `safe_join`. Tool failures
+//! Every tool dispatches through the **same layer the storage commands use**:
+//! mutating tools go through the active [`crate::providers::VaultHandle`] (via
+//! [`crate::vault::with_active`]) and read/search tools through the shared index
+//! dispatch (`crate::index::dispatch_*`). That means the AI works identically on
+//! a plain vault, an encrypted-files vault (separate keyed index), and a
+//! self-indexing encrypted-db vault — and a locked vault surfaces one clean
+//! "vault is locked" error rather than raw filesystem failures. Tool failures
 //! are returned to the model as `Error: …` results rather than propagated, so a
-//! bad argument never crashes the agent loop — the model can read the error and
-//! try again.
-
-use std::path::Path;
+//! bad argument never crashes the agent loop.
 
 use serde_json::{json, Value};
 use tauri::ipc::Channel;
 use tauri::Emitter;
-use walkdir::WalkDir;
 
 use super::revisions::Revisions;
 use super::{AiEvent, AppAiState, Gate};
-use crate::index::{AppState, Index};
-use crate::vault;
+use crate::index::{self, AppState};
+use crate::vault::{with_active, TreeNode};
+
+/// How a tool's undo snapshots are stored for the active vault: plaintext files
+/// in app-data (plain vaults) or encrypted inside the vault under `.revisions/`
+/// (encrypted vaults, so snapshot content never leaks to app-data).
+pub enum RevisionSink {
+    Fs(Revisions),
+    #[cfg(feature = "encryption")]
+    Handle,
+}
 
 /// Everything a tool needs to run.
 pub struct ToolContext<'a> {
     pub state: &'a AppState,
     pub ai: &'a AppAiState,
     pub channel: &'a Channel<AiEvent>,
-    pub root: std::path::PathBuf,
-    pub revisions: Revisions,
+    pub revisions: RevisionSink,
     /// App handle for firing global UI side-effect events (e.g. `open_note`).
     /// `None` in unit tests, where emission is a no-op.
     pub app: Option<tauri::AppHandle>,
+}
+
+impl ToolContext<'_> {
+    /// Snapshots `content` as an undo point of `rel`, choosing the storage
+    /// backend for the active vault.
+    fn snapshot(&self, rel: &str, content: &str) -> Result<String, String> {
+        match &self.revisions {
+            RevisionSink::Fs(r) => r.snapshot(rel, content),
+            #[cfg(feature = "encryption")]
+            RevisionSink::Handle => super::revisions::handle_snapshot(self.state, rel, content),
+        }
+    }
 }
 
 /// Result of running one tool.
@@ -256,17 +276,83 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("Missing required string argument '{key}'"))
 }
 
-/// Locks the index and runs `f` against it.
-fn with_index<T>(ctx: &ToolContext<'_>, f: impl FnOnce(&Index) -> Result<T, String>) -> Result<T, String> {
-    let guard = ctx.state.index.lock().map_err(|_| "Index lock poisoned".to_string())?;
-    let idx = guard.as_ref().ok_or("No vault is indexed")?;
-    f(idx)
+// ---------------------------------------------------------------------------
+// Storage dispatch through the active handle (plain / encrypted-db / encrypted-
+// files alike). Each helper takes one short lock on `state.active`, so revision
+// writes that also touch the handle never nest a lock.
+// ---------------------------------------------------------------------------
+
+fn h_scan(ctx: &ToolContext<'_>) -> Result<TreeNode, String> {
+    with_active(ctx.state, |h| h.scan_tree())
+}
+fn h_read(ctx: &ToolContext<'_>, rel: &str) -> Result<String, String> {
+    with_active(ctx.state, |h| h.read_note(rel))
+}
+fn h_write(ctx: &ToolContext<'_>, rel: &str, content: &str) -> Result<(), String> {
+    with_active(ctx.state, |h| h.write_note(ctx.state, rel, content))
+}
+fn h_create_folder(ctx: &ToolContext<'_>, rel: &str) -> Result<(), String> {
+    with_active(ctx.state, |h| h.create_folder(rel))
+}
+fn h_rename(ctx: &ToolContext<'_>, old: &str, new: &str) -> Result<(), String> {
+    with_active(ctx.state, |h| h.rename(ctx.state, old, new))
+}
+fn h_trash(ctx: &ToolContext<'_>, rel: &str) -> Result<(), String> {
+    with_active(ctx.state, |h| h.trash(ctx.state, rel))
+}
+
+/// True if a note (file) exists at `rel` in the active vault.
+fn note_exists(ctx: &ToolContext<'_>, rel: &str) -> bool {
+    h_read(ctx, rel).is_ok()
+}
+
+/// Finds a node by vault-relative path in a scanned tree.
+fn find_node<'a>(node: &'a TreeNode, path: &str) -> Option<&'a TreeNode> {
+    if path == node.path {
+        return Some(node);
+    }
+    for child in &node.children {
+        if path == child.path || path.starts_with(&format!("{}/", child.path)) {
+            return find_node(child, path);
+        }
+    }
+    None
+}
+
+/// Collects every folder's relative path from a scanned tree.
+fn collect_folders(node: &TreeNode, out: &mut Vec<String>) {
+    for child in &node.children {
+        if child.is_dir {
+            out.push(child.path.clone());
+            collect_folders(child, out);
+        }
+    }
+}
+
+/// Collects every `.md` note under (and including) `node`.
+fn collect_notes(node: &TreeNode, out: &mut Vec<String>) {
+    for child in &node.children {
+        if child.is_dir {
+            collect_notes(child, out);
+        } else {
+            out.push(child.path.clone());
+        }
+    }
+}
+
+/// Normalizes a note path to end in `.md`.
+fn with_md(path: &str) -> String {
+    if path.to_ascii_lowercase().ends_with(".md") {
+        path.to_string()
+    } else {
+        format!("{path}.md")
+    }
 }
 
 // ---- read tools ----
 
 fn search_notes(ctx: &ToolContext<'_>, query: &str) -> Result<ToolOutcome, String> {
-    let hits = with_index(ctx, |idx| idx.search(query, 25))?;
+    let hits = index::dispatch_search(ctx.state, query, 25)?;
     let arr: Vec<Value> = hits
         .iter()
         .map(|h| json!({ "path": h.path, "title": h.title, "snippet": strip_marks(&h.snippet), "tags": h.tags }))
@@ -276,7 +362,7 @@ fn search_notes(ctx: &ToolContext<'_>, query: &str) -> Result<ToolOutcome, Strin
 }
 
 fn list_notes(ctx: &ToolContext<'_>, limit: Option<u32>) -> Result<ToolOutcome, String> {
-    let mut notes = with_index(ctx, |idx| idx.list_notes())?;
+    let mut notes = index::dispatch_list_notes(ctx.state)?;
     let limit = limit.unwrap_or(50) as usize;
     notes.truncate(limit);
     let arr: Vec<Value> = notes.iter().map(|n| json!({ "path": n.path, "title": n.title })).collect();
@@ -285,64 +371,44 @@ fn list_notes(ctx: &ToolContext<'_>, limit: Option<u32>) -> Result<ToolOutcome, 
 }
 
 fn list_folders(ctx: &ToolContext<'_>) -> Result<ToolOutcome, String> {
-    let mut folders: Vec<String> = Vec::new();
-    for entry in WalkDir::new(&ctx.root)
-        .min_depth(1)
-        .into_iter()
-        .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
-    {
-        let entry = entry.map_err(|e| format!("Error scanning vault: {e}"))?;
-        if !entry.file_type().is_dir() {
-            continue;
-        }
-        if let Ok(rel) = vault::to_rel_string(&ctx.root, entry.path()) {
-            if !rel.is_empty() {
-                folders.push(rel);
-            }
-        }
-    }
+    let tree = h_scan(ctx)?;
+    let mut folders = Vec::new();
+    collect_folders(&tree, &mut folders);
     folders.sort();
     let summary = format!("Listed {} folder(s)", folders.len());
     Ok(ToolOutcome::ok(json!({ "folders": folders }), summary))
 }
 
 fn list_tags(ctx: &ToolContext<'_>) -> Result<ToolOutcome, String> {
-    let tags = with_index(ctx, |idx| idx.list_tags())?;
+    let tags = index::dispatch_list_tags(ctx.state)?;
     let arr: Vec<Value> = tags.iter().map(|t| json!({ "tag": t.tag, "count": t.count })).collect();
     let summary = format!("Listed {} tag(s)", arr.len());
     Ok(ToolOutcome::ok(json!({ "tags": arr }), summary))
 }
 
 fn notes_by_tag(ctx: &ToolContext<'_>, tag: &str) -> Result<ToolOutcome, String> {
-    let hits = with_index(ctx, |idx| idx.notes_by_tag(tag, 200))?;
+    let hits = index::dispatch_notes_by_tag(ctx.state, tag, 200)?;
     let arr: Vec<Value> = hits.iter().map(|h| json!({ "path": h.path, "title": h.title })).collect();
     let summary = format!("#{tag} — {} note(s)", arr.len());
     Ok(ToolOutcome::ok(json!({ "notes": arr }), summary))
 }
 
 fn read_note(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> {
-    let abs = vault::safe_join(&ctx.root, path)?;
-    if !abs.is_file() {
-        return Err(format!("Note does not exist: {path}"));
-    }
-    let content = std::fs::read_to_string(&abs).map_err(|e| format!("Could not read '{path}': {e}"))?;
+    let content = h_read(ctx, path).map_err(|_| format!("Note does not exist: {path}"))?;
     Ok(ToolOutcome::ok(json!({ "path": path, "content": content }), format!("Read {path}")))
 }
 
 fn note_links(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> {
-    let (outgoing, backlinks) = with_index(ctx, |idx| idx.links_for(path))?;
+    let (outgoing, backlinks) = index::dispatch_links_for(ctx.state, path)?;
     let summary = format!("{path}: {} out, {} back", outgoing.len(), backlinks.len());
     Ok(ToolOutcome::ok(json!({ "outgoing": outgoing, "backlinks": backlinks }), summary))
 }
 
-/// Ungated: validates that the note exists (vault-jailed), then fires a global
-/// `ai-open-note` app event so the UI opens it in the editor. The chat channel
-/// is for chat events; a global event keeps this UI side effect cleanly
-/// separate. Emission is best-effort and a no-op when no app handle is present
-/// (unit tests).
+/// Ungated: validates that the note exists (through the active handle), then
+/// fires a global `ai-open-note` app event so the UI opens it in the editor.
+/// Emission is best-effort and a no-op when no app handle is present (tests).
 fn open_note(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> {
-    let abs = vault::safe_join(&ctx.root, path)?;
-    if !abs.is_file() {
+    if !note_exists(ctx, path) {
         return Err(format!("Note does not exist: {path}"));
     }
     if let Some(app) = &ctx.app {
@@ -354,17 +420,23 @@ fn open_note(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> {
 // ---- write tools ----
 
 fn create_note(ctx: &ToolContext<'_>, path: &str, content: &str) -> Result<ToolOutcome, String> {
-    let created = vault::create_note_exact(&ctx.root, ctx.state, path, content)?;
-    Ok(ToolOutcome::ok(json!({ "path": created, "created": true }), format!("Created {created}")))
+    let rel = with_md(path);
+    if note_exists(ctx, &rel) {
+        return Err(format!(
+            "A file named '{rel}' already exists — pick another name"
+        ));
+    }
+    // Create the exact note through the handle. `create_note("")`/dir-target has
+    // untitled semantics, so write the content directly at the resolved path.
+    h_write(ctx, &rel, content)?;
+    Ok(ToolOutcome::ok(json!({ "path": rel, "created": true }), format!("Created {rel}")))
 }
 
 fn update_note(ctx: &ToolContext<'_>, path: &str, content: &str) -> Result<ToolOutcome, String> {
-    let abs = vault::safe_join(&ctx.root, path)?;
-    if !abs.is_file() {
-        return Err(format!("Note does not exist: {path} (use create_note to make it)"));
-    }
-    let revision_id = snapshot_current(ctx, path, &abs)?;
-    vault::write_note_at(&ctx.root, ctx.state, path, content)?;
+    let current = h_read(ctx, path)
+        .map_err(|_| format!("Note does not exist: {path} (use create_note to make it)"))?;
+    let revision_id = ctx.snapshot(path, &current)?;
+    h_write(ctx, path, content)?;
     Ok(ToolOutcome {
         result: json!({ "path": path, "updated": true }).to_string(),
         summary: format!("Updated {path}"),
@@ -374,18 +446,15 @@ fn update_note(ctx: &ToolContext<'_>, path: &str, content: &str) -> Result<ToolO
 }
 
 fn append_to_note(ctx: &ToolContext<'_>, path: &str, content: &str) -> Result<ToolOutcome, String> {
-    let abs = vault::safe_join(&ctx.root, path)?;
-    if !abs.is_file() {
-        return Err(format!("Note does not exist: {path} (use create_note to make it)"));
-    }
-    let current = std::fs::read_to_string(&abs).map_err(|e| format!("Could not read '{path}': {e}"))?;
-    let revision_id = ctx.revisions.snapshot(path, &current)?;
+    let current = h_read(ctx, path)
+        .map_err(|_| format!("Note does not exist: {path} (use create_note to make it)"))?;
+    let revision_id = ctx.snapshot(path, &current)?;
     let mut next = current;
     if !next.is_empty() && !next.ends_with('\n') {
         next.push('\n');
     }
     next.push_str(content);
-    vault::write_note_at(&ctx.root, ctx.state, path, &next)?;
+    h_write(ctx, path, &next)?;
     Ok(ToolOutcome {
         result: json!({ "path": path, "appended": true }).to_string(),
         summary: format!("Appended to {path}"),
@@ -395,7 +464,7 @@ fn append_to_note(ctx: &ToolContext<'_>, path: &str, content: &str) -> Result<To
 }
 
 fn rename_note(ctx: &ToolContext<'_>, old_path: &str, new_path: &str) -> Result<ToolOutcome, String> {
-    vault::rename_at(&ctx.root, ctx.state, old_path, new_path)?;
+    h_rename(ctx, old_path, new_path)?;
     Ok(ToolOutcome::ok(
         json!({ "old_path": old_path, "new_path": new_path }),
         format!("Renamed {old_path} → {new_path}"),
@@ -410,24 +479,23 @@ async fn move_note(
     path: &str,
     dest_folder: &str,
 ) -> Result<ToolOutcome, String> {
-    let file_name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| format!("Invalid note path: {path}"))?;
-    let src_abs = vault::safe_join(&ctx.root, path)?;
-    if !src_abs.is_file() {
+    let file_name = path.rsplit('/').next().filter(|s| !s.is_empty()).ok_or_else(|| {
+        format!("Invalid note path: {path}")
+    })?;
+    if !note_exists(ctx, path) {
         return Err(format!("Note does not exist: {path}"));
     }
     let dest = dest_folder.trim().trim_matches('/').to_string();
     let new_path = if dest.is_empty() {
-        file_name.clone()
+        file_name.to_string()
     } else {
         format!("{dest}/{file_name}")
     };
     if new_path == path {
         return Err("The note is already in that folder".into());
     }
-    if vault::safe_join(&ctx.root, &new_path)?.exists() {
+    // Collision: an existing note, or a folder of that name in the scanned tree.
+    if note_exists(ctx, &new_path) || path_is_dir(ctx, &new_path)? {
         return Err(format!("'{new_path}' already exists"));
     }
 
@@ -438,13 +506,19 @@ async fn move_note(
     {
         return Ok(denied(&[path]));
     }
-    // rename_at creates the destination folder (parent dirs) as needed.
-    vault::rename_at(&ctx.root, ctx.state, path, &new_path)?;
+    // The handle's rename creates the destination folder (parent dirs) as needed.
+    h_rename(ctx, path, &new_path)?;
     let shown = if dest.is_empty() { "(vault root)".to_string() } else { format!("{dest}/") };
     Ok(ToolOutcome::ok(
         json!({ "old_path": path, "new_path": new_path }),
         format!("Moved {path} → {shown}"),
     ))
+}
+
+/// True if `path` is a folder in the active vault (via a tree scan).
+fn path_is_dir(ctx: &ToolContext<'_>, path: &str) -> Result<bool, String> {
+    let tree = h_scan(ctx)?;
+    Ok(find_node(&tree, path).map(|n| n.is_dir).unwrap_or(false))
 }
 
 /// Gated: moves an entire folder under a new parent. Refuses self-nesting
@@ -460,8 +534,7 @@ async fn move_folder(
     if path.is_empty() {
         return Err("A folder path is required (the vault root cannot be moved)".into());
     }
-    let abs = vault::safe_join(&ctx.root, &path)?;
-    if !abs.is_dir() {
+    if !path_is_dir(ctx, &path)? {
         return Err(format!("Folder does not exist: {path}"));
     }
     let name = path.rsplit('/').next().unwrap_or(&path).to_string();
@@ -479,7 +552,7 @@ async fn move_folder(
     if new_path == path {
         return Err("The folder is already in that location".into());
     }
-    if vault::safe_join(&ctx.root, &new_path)?.exists() {
+    if note_exists(ctx, &new_path) || path_is_dir(ctx, &new_path)? {
         return Err(format!("'{new_path}' already exists"));
     }
 
@@ -490,10 +563,9 @@ async fn move_folder(
     {
         return Ok(denied(&[&path]));
     }
-    // rename_at registers self-writes for both folder rels (as rename_path
-    // does), creates the destination parent, renames the directory on disk,
-    // and calls Index::rename — which updates every `path/…` note by prefix.
-    vault::rename_at(&ctx.root, ctx.state, &path, &new_path)?;
+    // The handle's rename registers self-writes, creates the destination parent,
+    // renames the directory, and updates every `path/…` note in the index.
+    h_rename(ctx, &path, &new_path)?;
     let shown = if dest.is_empty() { "(vault root)".to_string() } else { format!("{dest}/") };
     Ok(ToolOutcome::ok(
         json!({ "old_path": path, "new_path": new_path }),
@@ -502,7 +574,7 @@ async fn move_folder(
 }
 
 fn create_folder(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> {
-    vault::create_folder_at(&ctx.root, path)?;
+    h_create_folder(ctx, path)?;
     Ok(ToolOutcome::ok(json!({ "path": path, "created": true }), format!("Created folder {path}")))
 }
 
@@ -516,7 +588,7 @@ async fn delete_note(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, S
     {
         return Ok(denied(&[path]));
     }
-    vault::trash_at(&ctx.root, ctx.state, path)?;
+    h_trash(ctx, path)?;
     Ok(ToolOutcome::ok(json!({ "path": path, "deleted": true }), format!("Deleted {path}")))
 }
 
@@ -540,7 +612,7 @@ async fn batch_delete(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutcome
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
     for p in &paths {
-        match vault::trash_at(&ctx.root, ctx.state, p) {
+        match h_trash(ctx, p) {
             Ok(()) => deleted.push(p.clone()),
             Err(e) => errors.push(format!("{p}: {e}")),
         }
@@ -568,33 +640,16 @@ async fn delete_folder(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome,
     if path.is_empty() {
         return Err("A folder path is required (the vault root cannot be deleted)".into());
     }
-    let abs = vault::safe_join(&ctx.root, &path)?;
-    if !abs.is_dir() {
-        return Err(format!("Folder does not exist: {path}"));
-    }
+    let tree = h_scan(ctx)?;
+    let folder = find_node(&tree, &path).filter(|n| n.is_dir);
+    let folder = match folder {
+        Some(f) => f,
+        None => return Err(format!("Folder does not exist: {path}")),
+    };
 
     // Enumerate contained notes so the user sees exactly what approval covers.
     let mut notes: Vec<String> = Vec::new();
-    for entry in WalkDir::new(&abs)
-        .min_depth(1)
-        .into_iter()
-        .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
-    {
-        let entry = entry.map_err(|e| format!("Error scanning folder: {e}"))?;
-        if entry.file_type().is_dir() {
-            continue;
-        }
-        if entry
-            .path()
-            .extension()
-            .map(|x| x.eq_ignore_ascii_case("md"))
-            .unwrap_or(false)
-        {
-            if let Ok(rel) = vault::to_rel_string(&ctx.root, entry.path()) {
-                notes.push(rel);
-            }
-        }
-    }
+    collect_notes(folder, &mut notes);
     notes.sort();
 
     if !ctx
@@ -604,7 +659,7 @@ async fn delete_folder(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome,
     {
         return Ok(denied(&[&path]));
     }
-    vault::trash_at(&ctx.root, ctx.state, &path)?;
+    h_trash(ctx, &path)?;
     Ok(ToolOutcome {
         result: json!({ "folder": path, "deleted": true, "notes": notes }).to_string(),
         summary: format!("Deleted folder {path} ({} note(s))", notes.len()),
@@ -623,12 +678,6 @@ fn denied(paths: &[&str]) -> ToolOutcome {
 }
 
 // ---- helpers ----
-
-/// Snapshots the current on-disk content of `path` before a mutation.
-fn snapshot_current(ctx: &ToolContext<'_>, path: &str, abs: &Path) -> Result<String, String> {
-    let current = std::fs::read_to_string(abs).map_err(|e| format!("Could not read '{path}': {e}"))?;
-    ctx.revisions.snapshot(path, &current)
-}
 
 /// Removes `<mark>`/`</mark>` snippet highlight markers for tool output.
 fn strip_marks(s: &str) -> String {
@@ -673,7 +722,21 @@ mod tests {
 
     use crate::ai::client::{consume_stream, ApiMessage, ChatClient};
     use crate::ai::settings::AiSettings;
-    use std::path::PathBuf;
+    use crate::index::Index;
+    use std::path::{Path, PathBuf};
+
+    /// Reads all indexed note paths straight from the in-memory index (test-only
+    /// helper that replaced the old `with_index`).
+    fn index_note_paths(ctx: &ToolContext<'_>) -> Vec<crate::index::NoteRef> {
+        ctx.state
+            .index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .list_notes()
+            .unwrap()
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
@@ -686,7 +749,9 @@ mod tests {
     }
 
     /// Builds an `AppState` whose index is an in-memory database rooted at
-    /// `root`, optionally pre-indexing `(rel, content)` notes.
+    /// `root`, optionally pre-indexing `(rel, content)` notes, and whose active
+    /// handle is a `PlainHandle` over `root` (so tools dispatch through the same
+    /// handle layer the commands use).
     fn state_with_index(root: &Path, notes: &[(&str, &str)]) -> AppState {
         let idx = Index::from_conn(rusqlite::Connection::open_in_memory().unwrap(), root).unwrap();
         for (rel, content) in notes {
@@ -694,6 +759,8 @@ mod tests {
         }
         let state = AppState::default();
         *state.index.lock().unwrap() = Some(idx);
+        *state.active.lock().unwrap() =
+            Some(Box::new(crate::providers::plain::PlainHandle::new(root)));
         state
     }
 
@@ -705,15 +772,14 @@ mod tests {
         state: &'a AppState,
         ai: &'a AppAiState,
         channel: &'a Channel<AiEvent>,
-        root: &Path,
+        _root: &Path,
         rev_dir: PathBuf,
     ) -> ToolContext<'a> {
         ToolContext {
             state,
             ai,
             channel,
-            root: root.to_path_buf(),
-            revisions: Revisions::new(rev_dir),
+            revisions: RevisionSink::Fs(Revisions::new(rev_dir)),
             app: None,
         }
     }
@@ -918,8 +984,7 @@ mod tests {
         assert!(!root.join("proj").exists());
 
         // Index paths were prefix-renamed.
-        let mut paths: Vec<String> = with_index(&ctx, |idx| idx.list_notes())
-            .unwrap()
+        let mut paths: Vec<String> = index_note_paths(&ctx)
             .into_iter()
             .map(|n| n.path)
             .collect();
@@ -1003,8 +1068,7 @@ mod tests {
         assert_eq!(paths, vec!["old/a.md", "old/sub/b.md"]);
 
         // Index rows for all children removed; unrelated note remains.
-        let remaining: Vec<String> = with_index(&ctx, |idx| idx.list_notes())
-            .unwrap()
+        let remaining: Vec<String> = index_note_paths(&ctx)
             .into_iter()
             .map(|n| n.path)
             .collect();
@@ -1030,7 +1094,7 @@ mod tests {
         );
         assert!(out.result.contains("\"denied\":true"), "{}", out.result);
         assert!(root.join("old/a.md").exists(), "denied delete must not touch the folder");
-        let count: Vec<_> = with_index(&ctx, |idx| idx.list_notes()).unwrap();
+        let count: Vec<_> = index_note_paths(&ctx);
         assert_eq!(count.len(), 1, "index untouched on denial");
 
         std::fs::remove_dir_all(&root).ok();

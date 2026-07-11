@@ -414,90 +414,31 @@ pub async fn create_encrypted_vault(
     })
 }
 
-/// True if `id` names an encrypted vault that isn't currently unlocked.
-#[tauri::command]
-pub async fn vault_needs_unlock(
-    app: tauri::AppHandle,
-    session: tauri::State<'_, SecretsSession>,
-    id: String,
-) -> Result<bool, String> {
-    let settings = load_settings(&app)?;
-    let vault = match settings.vaults.iter().find(|v| v.id == id) {
-        Some(v) => v,
-        None => return Ok(false),
-    };
-    if !EncryptedDbProvider::CAPS.needs_unlock || vault.kind != VaultKind::EncryptedDb {
-        return Ok(false);
-    }
-    Ok(!session.is_unlocked(&id))
-}
-
-/// Unlocks an encrypted vault with `password`, opening it as the active backend.
-/// A wrong password errors (SQLCipher fails to open). On success, optionally
-/// remembers the derived key in the OS keyring.
-#[tauri::command]
-pub async fn unlock_vault(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    session: tauri::State<'_, SecretsSession>,
-    id: String,
-    password: String,
+/// Unlocks an encrypted-db vault with `password`, opening it as the active
+/// backend. A wrong password errors (SQLCipher fails to open). On success the
+/// derived key is cached in the session and, if `remember`, the OS keyring.
+/// Called by the shared unlock command in [`crate::providers::unlock`].
+pub fn unlock_with_password(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    session: &SecretsSession,
+    vault: &Vault,
+    password: &str,
     remember: bool,
 ) -> Result<(), String> {
-    let settings = load_settings(&app)?;
-    let vault = settings
-        .vaults
-        .iter()
-        .find(|v| v.id == id)
-        .ok_or("No such vault")?
-        .clone();
-    if vault.kind != VaultKind::EncryptedDb {
-        return Err("This vault is not encrypted".into());
-    }
     let salt_hex = vault
         .config
         .get("salt")
         .and_then(|v| v.as_str())
         .ok_or("Vault is missing its key salt")?;
     let salt = crypto::from_hex(salt_hex)?;
-    let key = crypto::derive_vault_key(&password, &salt)?;
+    let key = crypto::derive_vault_key(password, &salt)?;
 
-    open_and_activate(&app, &state, &vault, key)?;
-    session.store(&id, key);
+    open_and_activate(app, state, vault, key)?;
+    session.store(&vault.id, key);
     if remember {
-        let _ = crypto::keyring_store(&id, &key);
+        let _ = crypto::keyring_store(&vault.id, &key);
     }
-    Ok(())
-}
-
-/// Tries to unlock `id` silently from the OS keyring (no prompt). Returns true
-/// if the vault became active. Used right after switching to an encrypted vault.
-#[tauri::command]
-pub async fn unlock_remembered(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<bool, String> {
-    let settings = load_settings(&app)?;
-    let vault = match settings.vaults.iter().find(|v| v.id == id) {
-        Some(v) => v.clone(),
-        None => return Ok(false),
-    };
-    Ok(auto_open(&app, &state, &vault))
-}
-
-/// Locks the active encrypted vault: clears the in-memory key, drops the backend
-/// (flushing a final snapshot on drop), and forgets any keyring copy.
-#[tauri::command]
-pub async fn lock_vault(
-    state: tauri::State<'_, AppState>,
-    session: tauri::State<'_, SecretsSession>,
-    id: String,
-) -> Result<(), String> {
-    session.lock(&id);
-    crypto::keyring_delete(&id);
-    // Dropping the handle triggers its final snapshot export.
-    *state.active.lock().unwrap() = None;
     Ok(())
 }
 

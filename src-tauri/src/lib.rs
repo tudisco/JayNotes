@@ -49,14 +49,18 @@ pub fn run() {
             providers::active_capabilities,
             #[cfg(feature = "provider-encrypted-db")]
             providers::encrypted_db::create_encrypted_vault,
-            #[cfg(feature = "provider-encrypted-db")]
-            providers::encrypted_db::vault_needs_unlock,
-            #[cfg(feature = "provider-encrypted-db")]
-            providers::encrypted_db::unlock_vault,
-            #[cfg(feature = "provider-encrypted-db")]
-            providers::encrypted_db::unlock_remembered,
-            #[cfg(feature = "provider-encrypted-db")]
-            providers::encrypted_db::lock_vault,
+            #[cfg(feature = "provider-encrypted-files")]
+            providers::encrypted_files::create_encrypted_files_vault,
+            // Shared unlock/lock commands (present whenever any encrypted
+            // provider is built), dispatching by vault kind.
+            #[cfg(feature = "encryption")]
+            providers::unlock::vault_needs_unlock,
+            #[cfg(feature = "encryption")]
+            providers::unlock::unlock_vault,
+            #[cfg(feature = "encryption")]
+            providers::unlock::unlock_remembered,
+            #[cfg(feature = "encryption")]
+            providers::unlock::lock_vault,
             vault::scan_vault,
             vault::read_note,
             vault::write_note,

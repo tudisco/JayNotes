@@ -18,6 +18,17 @@
 //! the key, but a passkey's PRF output is already 32 bytes and could be stored
 //! straight into the [`SecretsSession`] without touching any provider. Providers
 //! never see the password; they receive the derived key via the session.
+//!
+//! ## Opaque per-vault material (M15 encrypted-files)
+//!
+//! Not every provider's secret is a 32-byte SQLCipher key. The rclone-crypt
+//! provider derives an 80-byte `Keys` bundle (a different KDF entirely). The
+//! session therefore stores **opaque bytes** per vault; the `[u8; 32]` helpers
+//! ([`SecretsSession::store`]/[`get`]) are a thin typed façade over that store
+//! for encrypted-db, and [`store_bytes`]/[`get_bytes`] carry arbitrary material
+//! for encrypted-files. The keyring path gets matching hex helpers. A provider
+//! chooses which — see each provider's `unlock`. Nothing here ever holds a
+//! password: only derived key material is stored, in memory or (opt-in) keyring.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -47,7 +58,9 @@ pub fn derive_vault_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String>
 
 /// `n` cryptographically-random bytes, sourced from SQLite's `randomblob` (which
 /// draws from the OS CSPRNG) so no extra RNG dependency is needed — we already
-/// link SQLCipher.
+/// link SQLCipher. (Used by encrypted-db to generate its scrypt salt; the
+/// rclone KDF derives its own material, so encrypted-files needs no salt.)
+#[cfg(any(feature = "provider-encrypted-db", test))]
 pub fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
     let conn = rusqlite::Connection::open_in_memory()
         .map_err(|e| format!("Could not open RNG source: {e}"))?;
@@ -75,6 +88,7 @@ pub fn from_hex(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+#[cfg(feature = "provider-encrypted-db")]
 fn from_hex_32(s: &str) -> Option<[u8; 32]> {
     let v = from_hex(s).ok()?;
     if v.len() != 32 {
@@ -89,34 +103,61 @@ fn from_hex_32(s: &str) -> Option<[u8; 32]> {
 // Unlock session (Tauri-managed)
 // ---------------------------------------------------------------------------
 
-/// Per-vault unlocked key material, held in memory only. Cleared per-vault by
-/// [`SecretsSession::lock`] and never persisted (the OS keyring, opt-in, is the
-/// only place a key is stored across runs — see [`keyring_store`]).
+/// Per-vault unlocked key material, held in memory only as opaque bytes.
+/// Cleared per-vault by [`SecretsSession::lock`] and never persisted (the OS
+/// keyring, opt-in, is the only place material is stored across runs — see
+/// [`keyring_store`]). The bytes are provider-defined: a 32-byte SQLCipher key
+/// for encrypted-db, an 80-byte rclone `Keys` bundle for encrypted-files.
 #[derive(Default)]
 pub struct SecretsSession {
-    keys: Mutex<HashMap<String, Zeroizing<[u8; 32]>>>,
+    material: Mutex<HashMap<String, Zeroizing<Vec<u8>>>>,
 }
 
 impl SecretsSession {
+    /// Stores a 32-byte key (encrypted-db's SQLCipher raw key).
+    #[cfg(any(feature = "provider-encrypted-db", test))]
     pub fn store(&self, vault_id: &str, key: [u8; 32]) {
-        self.keys
-            .lock()
-            .unwrap()
-            .insert(vault_id.to_string(), Zeroizing::new(key));
+        self.store_bytes(vault_id, key.to_vec());
     }
 
-    /// A copy of the unlocked key for `vault_id`, if unlocked.
+    /// A copy of the unlocked 32-byte key for `vault_id`, if it is unlocked and
+    /// its material is exactly 32 bytes.
+    #[cfg(any(feature = "provider-encrypted-db", test))]
     pub fn get(&self, vault_id: &str) -> Option<[u8; 32]> {
-        self.keys.lock().unwrap().get(vault_id).map(|k| **k)
+        let bytes = self.get_bytes(vault_id)?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&bytes);
+        Some(k)
+    }
+
+    /// Stores arbitrary opaque material (encrypted-files' 80-byte `Keys` bundle).
+    pub fn store_bytes(&self, vault_id: &str, bytes: Vec<u8>) {
+        self.material
+            .lock()
+            .unwrap()
+            .insert(vault_id.to_string(), Zeroizing::new(bytes));
+    }
+
+    /// A copy of the unlocked opaque material for `vault_id`, if unlocked.
+    pub fn get_bytes(&self, vault_id: &str) -> Option<Vec<u8>> {
+        self.material
+            .lock()
+            .unwrap()
+            .get(vault_id)
+            .map(|k| k.to_vec())
     }
 
     pub fn is_unlocked(&self, vault_id: &str) -> bool {
-        self.keys.lock().unwrap().contains_key(vault_id)
+        self.material.lock().unwrap().contains_key(vault_id)
     }
 
-    /// Forgets the in-memory key for `vault_id` (the `Zeroizing` wrapper wipes it).
+    /// Forgets the in-memory material for `vault_id` (the `Zeroizing` wrapper
+    /// wipes it).
     pub fn lock(&self, vault_id: &str) {
-        self.keys.lock().unwrap().remove(vault_id);
+        self.material.lock().unwrap().remove(vault_id);
     }
 }
 
@@ -127,6 +168,7 @@ impl SecretsSession {
 /// Stores the derived key (hex) in the OS keyring for silent future unlocks.
 /// Errors are swallowed by the caller: a Linux box without a Secret Service
 /// simply won't remember, and must never crash the app.
+#[cfg(feature = "provider-encrypted-db")]
 pub fn keyring_store(vault_id: &str, key: &[u8; 32]) -> Result<(), String> {
     let entry =
         keyring::Entry::new(KEYRING_SERVICE, vault_id).map_err(|e| format!("Keyring: {e}"))?;
@@ -138,10 +180,47 @@ pub fn keyring_store(vault_id: &str, key: &[u8; 32]) -> Result<(), String> {
 /// Tries to fetch a remembered key from the OS keyring. Returns `None` on any
 /// failure (no keyring, no entry, corrupt value) so the caller falls back to a
 /// password prompt.
+#[cfg(feature = "provider-encrypted-db")]
 pub fn keyring_get(vault_id: &str) -> Option<[u8; 32]> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, vault_id).ok()?;
     let hex = entry.get_password().ok()?;
     from_hex_32(&hex)
+}
+
+/// Stores arbitrary derived key material (hex) in the OS keyring for silent
+/// future unlocks. Used by encrypted-files (an 80-byte `Keys` bundle). Like
+/// [`keyring_store`], this persists *derived key material*, never the password.
+#[cfg(feature = "provider-encrypted-files")]
+pub fn keyring_store_bytes(vault_id: &str, bytes: &[u8]) -> Result<(), String> {
+    let entry =
+        keyring::Entry::new(KEYRING_SERVICE, vault_id).map_err(|e| format!("Keyring: {e}"))?;
+    entry
+        .set_password(&to_hex(bytes))
+        .map_err(|e| format!("Keyring: {e}"))
+}
+
+/// Fetches remembered opaque material (hex) from the OS keyring, or `None`.
+#[cfg(feature = "provider-encrypted-files")]
+pub fn keyring_get_bytes(vault_id: &str) -> Option<Vec<u8>> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, vault_id).ok()?;
+    let hex = entry.get_password().ok()?;
+    from_hex(&hex).ok()
+}
+
+/// Derives a 32-byte SQLCipher key for the *separate search index* of an
+/// encrypted-files vault, domain-separated from the vault's content key material.
+///
+/// The index DB must never leak plaintext (it holds decrypted note bodies for
+/// FTS), so it is itself a SQLCipher container. Its key is derived from the
+/// unlocked content-key `material` (the rclone `Keys` bytes) via scrypt with a
+/// fixed domain salt — so it is a deterministic function of the vault's real key
+/// material, cannot be computed without unlocking the vault, and is distinct
+/// from any key used for the files themselves.
+#[cfg(feature = "provider-encrypted-files")]
+pub fn derive_index_key(material: &[u8]) -> Result<[u8; 32], String> {
+    // Domain-separated: hex the material and run it through the same scrypt as
+    // the vault KDF with a constant, purpose-specific salt.
+    derive_vault_key(&to_hex(material), b"jaynotes-idx-v1\0")
 }
 
 /// Removes a remembered key (on explicit lock / vault removal). Best-effort.

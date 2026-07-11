@@ -140,6 +140,107 @@ impl Revisions {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Handle-backed revisions (encrypted vaults)
+//
+// For an encrypted vault, snapshots must NOT be written to the app-data
+// plaintext store — that would leak note content. Instead they live under a
+// dot-prefixed `.revisions/` prefix INSIDE the vault, written through the active
+// handle so they are encrypted exactly like every other note (and hidden from
+// the tree + search, since scan and indexing skip dot-prefixed paths). The
+// manifest is a `.revisions/manifest.json` note. These free functions mirror the
+// [`Revisions`] API but take `&AppState` and dispatch through `with_active`.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "encryption")]
+mod handle_backed {
+    use super::*;
+    use crate::index::AppState;
+    use crate::vault::with_active;
+
+    const REV_DIR: &str = ".revisions";
+
+    fn manifest_rel() -> String {
+        format!("{REV_DIR}/manifest.json")
+    }
+
+    fn load_manifest(state: &AppState) -> Vec<RevEntry> {
+        match with_active(state, |h| h.read_note(&manifest_rel())) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn save_manifest(state: &AppState, entries: &[RevEntry]) -> Result<(), String> {
+        let raw = serde_json::to_string_pretty(entries)
+            .map_err(|e| format!("Could not serialize manifest: {e}"))?;
+        with_active(state, |h| h.write_note(state, &manifest_rel(), &raw))
+    }
+
+    /// Snapshots `content` as a revision of `rel`, encrypted inside the vault.
+    pub fn snapshot(state: &AppState, rel: &str, content: &str) -> Result<String, String> {
+        let ts = now_millis();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{ts}-{seq}");
+        let file = format!("{id}-{}.md", sanitize(rel));
+        let file_rel = format!("{REV_DIR}/{file}");
+        with_active(state, |h| h.write_note(state, &file_rel, content))?;
+
+        let mut entries = load_manifest(state);
+        entries.push(RevEntry {
+            id: id.clone(),
+            path: rel.to_string(),
+            file,
+            ts,
+        });
+        prune(state, &mut entries);
+        save_manifest(state, &entries)?;
+        Ok(id)
+    }
+
+    /// Drops oldest snapshots (and trashes their encrypted files) beyond the cap.
+    fn prune(state: &AppState, entries: &mut Vec<RevEntry>) {
+        if entries.len() <= MAX_PER_VAULT {
+            return;
+        }
+        let drop = entries.len() - MAX_PER_VAULT;
+        for e in entries.drain(..drop) {
+            let rel = format!("{REV_DIR}/{}", e.file);
+            let _ = with_active(state, |h| h.trash(state, &rel));
+        }
+    }
+
+    /// Lists snapshots for `rel`, newest first.
+    pub fn list(state: &AppState, rel: &str) -> Vec<RevisionMeta> {
+        let mut out: Vec<RevisionMeta> = load_manifest(state)
+            .into_iter()
+            .filter(|e| e.path == rel)
+            .map(|e| RevisionMeta {
+                id: e.id,
+                path: e.path,
+                ts: e.ts,
+            })
+            .collect();
+        out.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+        out
+    }
+
+    /// Resolves a revision id to `(original_path, snapshotted_content)`.
+    pub fn get(state: &AppState, id: &str) -> Result<(String, String), String> {
+        let entry = load_manifest(state)
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| format!("No such revision: {id}"))?;
+        let content = with_active(state, |h| h.read_note(&format!("{REV_DIR}/{}", entry.file)))?;
+        Ok((entry.path, content))
+    }
+}
+
+#[cfg(feature = "encryption")]
+pub use handle_backed::{
+    get as handle_get, list as handle_list, snapshot as handle_snapshot,
+};
+
 /// Turns a vault-relative path into a filesystem-safe, length-capped slug.
 fn sanitize(rel: &str) -> String {
     let mut s: String = rel

@@ -514,14 +514,38 @@ pub struct TagCount {
 
 impl Index {
     /// Opens (or creates) the index database at `db_path` for `vault_root`,
-    /// rebuilding the schema if the stored version doesn't match.
+    /// rebuilding the schema if the stored version doesn't match. Unkeyed: a
+    /// plain SQLite index for a plain vault.
     pub fn open(db_path: &Path, vault_root: &Path) -> Result<Index, String> {
+        Self::open_keyed(db_path, vault_root, None)
+    }
+
+    /// Opens (or creates) the index database, optionally as a SQLCipher-keyed
+    /// container.
+    ///
+    /// An encrypted-files vault must never leak plaintext into its search index
+    /// (the FTS bodies are decrypted note text), so its index is itself keyed
+    /// with a 32-byte raw key applied via `PRAGMA key = "x'…'"` — the same
+    /// SQLCipher raw-key mode the encrypted-db container uses. When `key` is
+    /// `None` the DB opens as ordinary SQLite (plain vaults). The vendored build
+    /// is SQLCipher, so a keyed reopen of an unkeyed DB (or a wrong key) fails at
+    /// the first query in [`ensure_schema`], surfacing as an error.
+    pub fn open_keyed(
+        db_path: &Path,
+        vault_root: &Path,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Index, String> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Could not create index dir: {e}"))?;
         }
         let conn = Connection::open(db_path)
             .map_err(|e| format!("Could not open index db: {e}"))?;
+        if let Some(key) = key {
+            let hex = to_hex_key(key);
+            conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))
+                .map_err(|e| format!("Could not key index db: {e}"))?;
+        }
         Self::from_conn(conn, vault_root)
     }
 
@@ -1190,6 +1214,17 @@ fn now_secs() -> i64 {
 // Vault-scoped setup
 // ---------------------------------------------------------------------------
 
+/// Lowercase hex of a 32-byte key, for the SQLCipher `PRAGMA key = "x'…'"`
+/// raw-key form. (A local copy so the plain-build index module doesn't depend on
+/// the encryption umbrella's `crypto::to_hex`.)
+fn to_hex_key(key: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in key {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 /// FNV-1a 64-bit hash of a string, hex-encoded. Stable across runs so a vault
 /// always maps to the same db filename.
 pub(crate) fn hash_path(p: &str) -> String {
@@ -1209,6 +1244,20 @@ fn db_path_for(app: &tauri::AppHandle, vault_root: &Path) -> Result<PathBuf, Str
         .map_err(|e| format!("Could not resolve app data dir: {e}"))?;
     let name = format!("{}.db", hash_path(&vault_root.to_string_lossy()));
     Ok(dir.join("indexes").join(name))
+}
+
+/// Opens (or creates) a SQLCipher-**keyed** index for an encrypted-files vault
+/// at the standard `app_data/indexes/<hash>.db` location. Unlike
+/// [`init_for_vault`], this only opens the DB — the encrypted-files handle
+/// populates and watches it, since only the handle can decrypt names/content.
+#[cfg(feature = "provider-encrypted-files")]
+pub(crate) fn open_keyed_index(
+    app: &tauri::AppHandle,
+    vault_root: &Path,
+    key: &[u8; 32],
+) -> Result<Index, String> {
+    let db_path = db_path_for(app, vault_root)?;
+    Index::open_keyed(&db_path, vault_root, Some(key))
 }
 
 /// Opens the index for `vault_root`, starts a fresh file watcher, and kicks off
@@ -1278,11 +1327,105 @@ fn active_owns_index(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
+/// Error message for a search/index operation attempted with no usable index —
+/// distinguishes a locked encrypted vault (nothing open at all) from a plain
+/// vault whose index just isn't ready.
+fn no_index_error(state: &AppState) -> String {
+    if state.active.lock().unwrap().is_none() {
+        "The vault is locked — unlock it to continue.".to_string()
+    } else {
+        "No vault is indexed".to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared index dispatch (one branching point for both the commands below and
+// the AI tools in `crate::ai::tools`, so search behaves identically on a plain
+// vault, an encrypted-files vault (separate keyed index), and a self-indexing
+// encrypted-db vault).
+// ---------------------------------------------------------------------------
+
+/// Full-text + tag search through whichever index the active vault uses.
+pub(crate) fn dispatch_search(
+    state: &AppState,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<SearchHit>, String> {
+    if active_owns_index(state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().search(query, limit);
+    }
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or_else(|| no_index_error(state))?;
+    index.search(query, limit)
+}
+
+/// All notes (newest first) through the active vault's index.
+pub(crate) fn dispatch_list_notes(state: &AppState) -> Result<Vec<NoteRef>, String> {
+    if active_owns_index(state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().list_notes();
+    }
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or_else(|| no_index_error(state))?;
+    index.list_notes()
+}
+
+/// Every distinct tag with its note count.
+pub(crate) fn dispatch_list_tags(state: &AppState) -> Result<Vec<TagCount>, String> {
+    if active_owns_index(state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().list_tags();
+    }
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or_else(|| no_index_error(state))?;
+    index.list_tags()
+}
+
+/// Notes carrying exactly `tag`.
+pub(crate) fn dispatch_notes_by_tag(
+    state: &AppState,
+    tag: &str,
+    limit: u32,
+) -> Result<Vec<SearchHit>, String> {
+    if active_owns_index(state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().notes_by_tag(tag, limit);
+    }
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or_else(|| no_index_error(state))?;
+    index.notes_by_tag(tag, limit)
+}
+
+/// `(outgoing, backlinks)` for `rel`. A self-indexing container has no
+/// wikilink graph exposed, so it reports empty; plain/encrypted-files use the
+/// FTS `links` table.
+pub(crate) fn dispatch_links_for(
+    state: &AppState,
+    rel: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    if active_owns_index(state) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or_else(|| no_index_error(state))?;
+    index.links_for(rel)
+}
+
 /// Forces a full rescan of the current vault. Returns the number of files
 /// (re)indexed.
 #[tauri::command]
 pub async fn reindex_vault(state: tauri::State<'_, AppState>) -> Result<usize, String> {
-    if active_owns_index(&state) {
+    // A handle that owns reindexing (encrypted-db owns the index; encrypted-files
+    // owns the decrypt-scan that populates the separate index) drives it itself.
+    let owns_reindex = state
+        .active
+        .lock()
+        .unwrap()
+        .as_deref()
+        .map(|h| h.owns_reindex())
+        .unwrap_or(false);
+    if owns_reindex {
         let g = state.active.lock().unwrap();
         return g.as_deref().unwrap().reindex();
     }
@@ -1310,37 +1453,19 @@ pub async fn search_notes(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<SearchHit>, String> {
-    if active_owns_index(&state) {
-        let g = state.active.lock().unwrap();
-        return g.as_deref().unwrap().search(&query, limit.unwrap_or(50));
-    }
-    let guard = state.index.lock().unwrap();
-    let index = guard.as_ref().ok_or("No vault is indexed")?;
-    index.search(&query, limit.unwrap_or(50))
+    dispatch_search(&state, &query, limit.unwrap_or(50))
 }
 
 /// Lists all indexed notes, newest first, for the quick switcher.
 #[tauri::command]
 pub async fn list_notes(state: tauri::State<'_, AppState>) -> Result<Vec<NoteRef>, String> {
-    if active_owns_index(&state) {
-        let g = state.active.lock().unwrap();
-        return g.as_deref().unwrap().list_notes();
-    }
-    let guard = state.index.lock().unwrap();
-    let index = guard.as_ref().ok_or("No vault is indexed")?;
-    index.list_notes()
+    dispatch_list_notes(&state)
 }
 
 /// Lists every distinct tag with its note count, sorted alphabetically.
 #[tauri::command]
 pub async fn list_tags(state: tauri::State<'_, AppState>) -> Result<Vec<TagCount>, String> {
-    if active_owns_index(&state) {
-        let g = state.active.lock().unwrap();
-        return g.as_deref().unwrap().list_tags();
-    }
-    let guard = state.index.lock().unwrap();
-    let index = guard.as_ref().ok_or("No vault is indexed")?;
-    index.list_tags()
+    dispatch_list_tags(&state)
 }
 
 /// Lists notes carrying exactly `tag`, sorted by title. `limit` defaults to 500.
@@ -1350,13 +1475,7 @@ pub async fn notes_by_tag(
     tag: String,
     limit: Option<u32>,
 ) -> Result<Vec<SearchHit>, String> {
-    if active_owns_index(&state) {
-        let g = state.active.lock().unwrap();
-        return g.as_deref().unwrap().notes_by_tag(&tag, limit.unwrap_or(500));
-    }
-    let guard = state.index.lock().unwrap();
-    let index = guard.as_ref().ok_or("No vault is indexed")?;
-    index.notes_by_tag(&tag, limit.unwrap_or(500))
+    dispatch_notes_by_tag(&state, &tag, limit.unwrap_or(500))
 }
 
 // ---------------------------------------------------------------------------

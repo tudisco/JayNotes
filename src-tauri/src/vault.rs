@@ -36,6 +36,11 @@ pub enum VaultKind {
     #[default]
     Plain,
     EncryptedDb,
+    /// M15: rclone-crypt file-per-note vault (Syncthing-friendly). Gated behind
+    /// `provider-encrypted-files` at the provider layer; the variant is always
+    /// present so a settings file written by a full build still deserializes in
+    /// a build without the feature (shows "unsupported").
+    EncryptedFiles,
 }
 
 impl VaultKind {
@@ -44,6 +49,7 @@ impl VaultKind {
         match self {
             VaultKind::Plain => "plain",
             VaultKind::EncryptedDb => "encrypted-db",
+            VaultKind::EncryptedFiles => "encrypted-files",
         }
     }
 }
@@ -296,7 +302,23 @@ pub(crate) fn scan_tree(root: &Path) -> Result<TreeNode, String> {
     Ok(root_node)
 }
 
-fn insert_node(root: &mut TreeNode, rel: &Path, is_dir: bool) {
+/// Builds an empty root `TreeNode` named after `root`'s basename (its `path` is
+/// the empty string). Used by the encrypted-files provider, which populates it
+/// from decrypted plaintext paths.
+#[cfg(feature = "provider-encrypted-files")]
+pub(crate) fn empty_root_node(root: &Path) -> TreeNode {
+    TreeNode {
+        name: root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.display().to_string()),
+        path: String::new(),
+        is_dir: true,
+        children: Vec::new(),
+    }
+}
+
+pub(crate) fn insert_node(root: &mut TreeNode, rel: &Path, is_dir: bool) {
     let parts: Vec<String> = rel
         .components()
         .filter_map(|c| match c {
@@ -325,7 +347,7 @@ fn insert_node(root: &mut TreeNode, rel: &Path, is_dir: bool) {
     }
 }
 
-fn sort_tree(node: &mut TreeNode) {
+pub(crate) fn sort_tree(node: &mut TreeNode) {
     node.children.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
@@ -905,43 +927,6 @@ pub(crate) fn write_note_at(
     atomic_write(&path, content.as_bytes())?;
     index_upsert(state, rel, content);
     Ok(())
-}
-
-/// Creates a new note at the exact `rel` path with `content`. Appends `.md`
-/// when the caller omitted it. Errors if the file already exists. Returns the
-/// final relative path.
-pub(crate) fn create_note_exact(
-    root: &Path,
-    state: &AppState,
-    rel: &str,
-    content: &str,
-) -> Result<String, String> {
-    if rel.trim().is_empty() {
-        return Err("A note path is required".to_string());
-    }
-    let mut path = safe_join(root, rel)?;
-    if !is_markdown(&path) {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .ok_or_else(|| format!("Invalid note path: {rel}"))?;
-        path.set_file_name(format!("{name}.md"));
-    }
-    if path.exists() {
-        return Err(format!(
-            "A file named '{}' already exists — pick another name",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Could not create parent folders: {e}"))?;
-    }
-    let created_rel = to_rel_string(root, &path)?;
-    register_write(&state.recent_writes, &created_rel);
-    atomic_write(&path, content.as_bytes())?;
-    index_upsert(state, &created_rel, content);
-    Ok(created_rel)
 }
 
 /// Creates a folder (and any missing parents) at `rel`. Errors if it exists.

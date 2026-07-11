@@ -35,8 +35,14 @@ pub mod plain;
 #[cfg(feature = "provider-encrypted-db")]
 pub mod encrypted_db;
 
+#[cfg(feature = "provider-encrypted-files")]
+pub mod encrypted_files;
+
 #[cfg(feature = "encryption")]
 pub mod crypto;
+
+#[cfg(feature = "encryption")]
+pub mod unlock;
 
 // ---------------------------------------------------------------------------
 // Metadata the frontend renders (vault-type picker + config forms)
@@ -148,6 +154,15 @@ pub trait VaultHandle: Send + Sync {
     fn owns_index(&self) -> bool {
         false
     }
+    /// True when a manual "reindex" must be driven through this handle rather
+    /// than `state.index.full_scan()`. Defaults to [`Self::owns_index`]. The
+    /// encrypted-files handle overrides this to `true` while keeping
+    /// `owns_index() == false`: it *populates* the separate `state.index`, but a
+    /// plain filesystem `full_scan` over its ciphertext backing would be wrong —
+    /// only the handle can decrypt names and content to rebuild the index.
+    fn owns_reindex(&self) -> bool {
+        self.owns_index()
+    }
     fn search(&self, _query: &str, _limit: u32) -> Result<Vec<SearchHit>, String> {
         Err("This vault does not provide search directly".into())
     }
@@ -180,6 +195,9 @@ pub trait VaultHandle: Send + Sync {
 const PLAIN: plain::PlainProvider = plain::PlainProvider;
 #[cfg(feature = "provider-encrypted-db")]
 const ENCRYPTED_DB: encrypted_db::EncryptedDbProvider = encrypted_db::EncryptedDbProvider;
+#[cfg(feature = "provider-encrypted-files")]
+const ENCRYPTED_FILES: encrypted_files::EncryptedFilesProvider =
+    encrypted_files::EncryptedFilesProvider;
 
 /// Every provider compiled into this build, plain first. Assembled with
 /// `#[cfg]` so an omitted feature drops both the module and its entry.
@@ -188,6 +206,8 @@ pub fn providers() -> Vec<&'static dyn VaultProvider> {
     let mut list: Vec<&'static dyn VaultProvider> = vec![&PLAIN];
     #[cfg(feature = "provider-encrypted-db")]
     list.push(&ENCRYPTED_DB);
+    #[cfg(feature = "provider-encrypted-files")]
+    list.push(&ENCRYPTED_FILES);
     list
 }
 
@@ -223,6 +243,10 @@ pub fn try_auto_open(
     #[cfg(feature = "provider-encrypted-db")]
     if vault.kind == crate::vault::VaultKind::EncryptedDb {
         return encrypted_db::auto_open(app, state, vault);
+    }
+    #[cfg(feature = "provider-encrypted-files")]
+    if vault.kind == crate::vault::VaultKind::EncryptedFiles {
+        return encrypted_files::auto_open(app, state, vault);
     }
     let _ = (app, state, vault);
     false
@@ -319,6 +343,32 @@ mod tests {
         assert!(keys.contains(&"location"));
         assert!(keys.contains(&"name"));
         assert!(keys.contains(&"password"));
+    }
+
+    #[cfg(feature = "provider-encrypted-files")]
+    #[test]
+    fn encrypted_files_present_when_feature_on() {
+        assert!(kind_supported("encrypted-files"));
+        let meta = provider_for_kind("encrypted-files").unwrap().metadata();
+        assert!(meta.capabilities.needs_unlock);
+        assert!(!meta.capabilities.reveal_in_finder);
+        assert!(meta.capabilities.folder_backed);
+        // Config form: location, name, password (+ confirm), and an optional
+        // advanced password2/salt field.
+        let fields: Vec<(&str, bool)> = meta
+            .config_fields
+            .iter()
+            .map(|f| (f.key.as_str(), f.required))
+            .collect();
+        assert!(fields.contains(&("location", true)));
+        assert!(fields.contains(&("password", true)));
+        assert!(fields.contains(&("password2", false)), "password2 is optional");
+    }
+
+    #[cfg(not(feature = "provider-encrypted-files"))]
+    #[test]
+    fn encrypted_files_absent_without_feature() {
+        assert!(!kind_supported("encrypted-files"));
     }
 
     #[test]

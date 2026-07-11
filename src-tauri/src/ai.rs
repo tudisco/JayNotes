@@ -42,10 +42,36 @@ use tokio::sync::{oneshot, Notify};
 
 use client::{ApiMessage, ChatClient, StreamPiece};
 use revisions::{RevisionMeta, Revisions};
-use tools::ToolContext;
+use tools::{RevisionSink, ToolContext};
 
 use crate::index::AppState;
 use crate::vault;
+
+/// True when the active vault is an encrypted (needs-unlock) vault, so undo
+/// snapshots must be stored encrypted inside the vault rather than as plaintext
+/// files in app-data. Only exists in a build with an encrypted provider.
+#[cfg(feature = "encryption")]
+fn active_is_encrypted(state: &AppState) -> bool {
+    state
+        .active
+        .lock()
+        .unwrap()
+        .as_deref()
+        .map(|h| h.capabilities().needs_unlock)
+        .unwrap_or(false)
+}
+
+/// Builds the revision sink for the active vault: encrypted vaults keep undo
+/// snapshots inside the vault (`.revisions/`), plain vaults in app-data.
+fn build_revision_sink(app: &tauri::AppHandle, state: &AppState) -> Result<RevisionSink, String> {
+    let _ = state; // used only by the encrypted branch below
+    #[cfg(feature = "encryption")]
+    if active_is_encrypted(state) {
+        return Ok(RevisionSink::Handle);
+    }
+    let root = vault::vault_root(app)?;
+    Ok(RevisionSink::Fs(Revisions::new(revisions_dir(app, &root)?)))
+}
 
 /// Max tool-execution rounds in a single turn before the model is told to wrap
 /// up and answer without tools.
@@ -318,13 +344,15 @@ fn revisions_dir(app: &tauri::AppHandle, vault_root: &std::path::Path) -> Result
 // System prompt
 // ---------------------------------------------------------------------------
 
-fn system_messages(app: &tauri::AppHandle, current_note: &Option<String>) -> Vec<ApiMessage> {
+fn system_messages(state: &AppState, current_note: &Option<String>) -> Vec<ApiMessage> {
     let mut msgs = vec![ApiMessage::system(base_system_prompt())];
 
     if let Some(rel) = current_note {
-        if let Ok(root) = vault::vault_root(app) {
-            if let Ok(abs) = vault::safe_join(&root, rel) {
-                if let Ok(content) = std::fs::read_to_string(&abs) {
+        // Read through the active handle so an encrypted vault's note is
+        // decrypted (and a locked vault simply contributes no note context).
+        if let Ok(content) = vault::with_active(state, |h| h.read_note(rel)) {
+            {
+                {
                     let (body, truncated) = if content.chars().count() > NOTE_CONTEXT_LIMIT {
                         (content.chars().take(NOTE_CONTEXT_LIMIT).collect::<String>(), true)
                     } else {
@@ -453,18 +481,15 @@ async fn run_turn(
     let client = ChatClient::new(&settings)?;
     let schemas = tools::tool_schemas();
 
-    let root = vault::vault_root(app)?;
-    let rev_dir = revisions_dir(app, &root)?;
     let ctx = ToolContext {
         state,
         ai,
         channel,
-        root: root.clone(),
-        revisions: Revisions::new(rev_dir),
+        revisions: build_revision_sink(app, state)?,
         app: Some(app.clone()),
     };
 
-    let system = system_messages(app, current_note);
+    let system = system_messages(state, current_note);
     let mut rounds = 0u32;
 
     loop {
@@ -591,26 +616,46 @@ pub async fn ai_permission_respond(
     Ok(())
 }
 
-/// Lists undo snapshots taken for `path`, newest first.
+/// Lists undo snapshots taken for `path`, newest first. Encrypted vaults keep
+/// their revision manifest inside the vault; plain vaults in app-data.
 #[tauri::command]
 pub async fn ai_list_revisions(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<Vec<RevisionMeta>, String> {
+    let _ = &state; // used only by the encrypted branch below
+    #[cfg(feature = "encryption")]
+    if active_is_encrypted(state.inner()) {
+        return Ok(revisions::handle_list(state.inner(), &path));
+    }
     let root = vault::vault_root(&app)?;
     let dir = revisions_dir(&app, &root)?;
     Ok(Revisions::new(dir).list(&path))
 }
 
 /// Reverts a note to a snapshot. The pre-revert state is itself snapshotted, so
-/// the revert can be undone. Restores via the normal write path (self-write +
-/// reindex).
+/// the revert can be undone. Restores through the active handle (self-write +
+/// reindex), so it works for plain and encrypted vaults alike.
 #[tauri::command]
 pub async fn ai_revert(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     revision_id: String,
 ) -> Result<String, String> {
+    let st = state.inner();
+
+    #[cfg(feature = "encryption")]
+    if active_is_encrypted(st) {
+        let (path, content) = revisions::handle_get(st, &revision_id)?;
+        // Snapshot current content first so the revert is itself revertible.
+        if let Ok(current) = vault::with_active(st, |h| h.read_note(&path)) {
+            let _ = revisions::handle_snapshot(st, &path, &current);
+        }
+        vault::with_active(st, |h| h.write_note(st, &path, &content))?;
+        return Ok(path);
+    }
+
     let root = vault::vault_root(&app)?;
     let dir = revisions_dir(&app, &root)?;
     let revs = Revisions::new(dir);
@@ -621,7 +666,7 @@ pub async fn ai_revert(
     if let Ok(current) = std::fs::read_to_string(&abs) {
         let _ = revs.snapshot(&path, &current);
     }
-    vault::write_note_at(&root, state.inner(), &path, &content)?;
+    vault::write_note_at(&root, st, &path, &content)?;
     Ok(path)
 }
 

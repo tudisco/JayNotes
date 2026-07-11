@@ -22,13 +22,16 @@ tauri-build = { version = "2", features = [] }
 # providers OUT with `--no-default-features` plus an explicit list. The frontend
 # hardcodes nothing (see `list_providers`), so an omitted provider leaves zero
 # UI trace and a saved vault of that kind shows "unsupported in this build".
-default = ["provider-encrypted-db"]
+default = ["provider-encrypted-db", "provider-encrypted-files"]
 # Internal umbrella pulled in by every encrypted provider: the shared KDF,
 # unlock-session, and OS-keyring plumbing (compiled only when something needs it).
 encryption = ["dep:keyring", "dep:scrypt", "dep:zeroize"]
 provider-encrypted-db = ["encryption"]
-# Declared placeholders for later milestones (M15/M16); no module yet.
-provider-encrypted-files = ["encryption"]
+# M15: Syncthing-friendly file-per-note encryption via the local rclone-crypt
+# library (rclone-compatible names + content). Pulls in the encryption umbrella
+# and the path-dependency library.
+provider-encrypted-files = ["encryption", "dep:rclone-crypt"]
+# Declared placeholder for M16; no module yet.
 provider-tinylord = []
 
 [dependencies]
@@ -47,10 +50,14 @@ rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher-vendored-openssl
 keyring = { version = "3", optional = true }
 scrypt = { version = "0.11", optional = true }
 zeroize = { version = "1", optional = true }
+# M15 encrypted-files: the user's rclone-compatible crypt library (path dep;
+# absolute path is acceptable for this personal build). Optional — pulled in only
+# by the provider-encrypted-files feature.
+rclone-crypt = { path = "/Volumes/WorkDrive/Hot/Jason3/RcloneCryptRustLib/crates/rclone-crypt", optional = true }
 notify-debouncer-full = "0.7.0"
 serde_yaml = "0.9.34"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "http2"] }
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "io-util"] }
 comrak = { version = "0.53", default-features = false }
 typst = "0.15"
 typst-layout = "0.15"
