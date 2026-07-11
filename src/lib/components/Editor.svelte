@@ -8,6 +8,13 @@
 
   Crepe has no cheap "set markdown" API, so switching notes tears the editor
   down and recreates it — simple and reliable.
+
+  The verbatim frontmatter string is a `$bindable` prop so it can be lifted to
+  EditorPane and shared with PropertiesBar: the editor loads it, owns the body,
+  and both write through this single source of truth. When the properties bar
+  mutates the frontmatter it calls the exported `requestSave()`, which persists
+  `joinFrontmatter(frontmatter, body)` on the same path the autosave uses — so
+  neither side can clobber the other's changes.
 -->
 <script lang="ts">
   import { onDestroy } from "svelte";
@@ -15,19 +22,22 @@
   import { readNote, writeNote, vaultError } from "$lib/stores/vault";
   import { joinFrontmatter, splitFrontmatter } from "$lib/utils/frontmatter";
 
-  let { path }: { path: string } = $props();
+  let {
+    path,
+    frontmatter = $bindable(null),
+  }: { path: string; frontmatter?: string | null } = $props();
 
   const SAVE_DEBOUNCE_MS = 600;
 
   let host: HTMLDivElement;
   let crepe: Crepe | null = null;
 
-  /** Verbatim frontmatter of the currently loaded note (null when none). */
-  let frontmatter: string | null = null;
   /** Path of the note currently mounted in the editor. */
   let currentPath: string | null = null;
   /** Body content as last persisted to disk (Crepe-serialized form). */
   let lastSavedBody = "";
+  /** Frontmatter as last persisted to disk — lets us detect properties edits. */
+  let lastSavedFrontmatter: string | null = null;
   /** True only once the editor is fully created — guards initial-load events. */
   let loaded = false;
   /** Monotonic token to discard stale async load/teardown work. */
@@ -49,14 +59,16 @@
     clearSaveTimer();
     if (!crepe || !loaded || !currentPath) return;
     const body = crepe.getMarkdown();
-    if (body === lastSavedBody) {
+    if (body === lastSavedBody && frontmatter === lastSavedFrontmatter) {
       status = "saved";
       return;
     }
     const target = currentPath;
+    const fm = frontmatter;
     try {
-      await writeNote(target, joinFrontmatter(frontmatter, body));
+      await writeNote(target, joinFrontmatter(fm, body));
       lastSavedBody = body;
+      lastSavedFrontmatter = fm;
       status = "saved";
     } catch (e) {
       status = "idle";
@@ -68,6 +80,16 @@
     status = "saving";
     clearSaveTimer();
     saveTimer = setTimeout(() => void flush(), SAVE_DEBOUNCE_MS);
+  }
+
+  /**
+   * Persist a frontmatter change made outside the editor (the properties bar).
+   * Uses the same debounced save path so tag/field edits and body edits share
+   * one writer and can't overwrite each other.
+   */
+  export function requestSave(): void {
+    if (!loaded) return;
+    scheduleSave();
   }
 
   /** Flush + destroy the current editor instance. */
@@ -94,6 +116,7 @@
     loadError = null;
     const split = splitFrontmatter(raw);
     frontmatter = split.frontmatter;
+    lastSavedFrontmatter = split.frontmatter;
     currentPath = p;
 
     // Recreate into a clean host in case any prior DOM survived teardown.

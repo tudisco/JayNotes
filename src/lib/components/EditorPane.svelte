@@ -1,9 +1,21 @@
 <script lang="ts">
   import Editor from "./Editor.svelte";
+  import PropertiesBar from "./PropertiesBar.svelte";
   import { renameNote, selected, vaultError } from "$lib/stores/vault";
 
   let fileSelected = $derived($selected !== null && !$selected.isDir);
   let notePath = $derived(fileSelected ? ($selected as { path: string }).path : null);
+
+  // Single shared source of truth for the current note's verbatim frontmatter.
+  // Editor loads it (and owns the body); PropertiesBar edits it. Both persist
+  // through the same Editor writer so their saves can't clobber each other.
+  let editor = $state<Editor | undefined>();
+  let frontmatter = $state<string | null>(null);
+
+  function onPropertiesChange(fm: string | null): void {
+    frontmatter = fm;
+    editor?.requestSave();
+  }
 
   function baseName(path: string): string {
     return (path.split("/").pop() ?? "").replace(/\.md$/i, "");
@@ -49,18 +61,23 @@
 <section class="editor-pane" class:has-note={fileSelected}>
   {#if fileSelected && notePath}
     <div class="note-view">
-      <header class="note-header">
-        <input
-          class="note-title"
-          type="text"
-          bind:value={titleDraft}
-          spellcheck="false"
-          aria-label="Note title"
-          onkeydown={onTitleKey}
-          onblur={commitTitle}
-        />
-      </header>
-      <Editor path={notePath} />
+      {#key notePath}
+        <div class="note-meta">
+          <header class="note-header">
+            <input
+              class="note-title"
+              type="text"
+              bind:value={titleDraft}
+              spellcheck="false"
+              aria-label="Note title"
+              onkeydown={onTitleKey}
+              onblur={commitTitle}
+            />
+          </header>
+          <PropertiesBar {frontmatter} onChange={onPropertiesChange} />
+        </div>
+        <Editor bind:this={editor} path={notePath} bind:frontmatter />
+      {/key}
     </div>
   {:else}
     <div class="empty-state">
@@ -95,12 +112,27 @@
     flex-direction: column;
   }
 
-  .note-header {
+  .note-meta {
     flex-shrink: 0;
+  }
+
+  .note-header {
     max-width: 46rem;
     width: 100%;
     margin: 0 auto;
     padding: 28px 16px 4px;
+  }
+
+  /* The bare "+ Add properties" affordance stays out of the way until the
+     title/properties area is hovered or focused. */
+  .note-meta :global(.add-props) {
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+
+  .note-meta:hover :global(.add-props),
+  .note-meta:focus-within :global(.add-props) {
+    opacity: 1;
   }
 
   .note-title {
