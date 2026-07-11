@@ -20,15 +20,105 @@ const SETTINGS_FILE: &str = "settings.json";
 // Types
 // ---------------------------------------------------------------------------
 
+/// The kind of a vault. `Plain` is the only kind in M13; M14 adds `Encrypted`.
+///
+/// Kept as an enum (rather than a bare string) specifically so downstream
+/// `match` statements are exhaustive and the compiler flags every site that
+/// must learn about a new kind when one is added. Serializes lowercase
+/// (`"plain"`) to match the frontend contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VaultKind {
+    #[default]
+    Plain,
+}
+
+/// One configured vault: a stable id, a display name, an absolute folder path,
+/// and its kind. Persisted verbatim in `settings.json` under `vaults`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Vault {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub kind: VaultKind,
+}
+
 /// Persisted app settings. Unknown keys are preserved via `extra` so future
 /// milestones can add fields without clobbering older ones.
+///
+/// The legacy single-vault `vault_path` field is still deserialized so the
+/// [`migrate`] step can convert it into a `vaults` entry, after which it is
+/// dropped (never re-serialized once `vaults` is populated).
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vaults: Vec<Vault>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_vault_id: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Generates a short, collision-resistant, nanoid-style id (hex).
+///
+/// Combines the current time in nanoseconds, the process id, and a per-process
+/// monotonic counter so ids are unique within and across app runs without
+/// pulling in a uuid/rand dependency.
+pub(crate) fn new_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}{pid:x}{c:x}")
+}
+
+/// The folder basename of a path, used as a vault's default display name.
+/// Falls back to "Vault" for a path with no final component.
+pub(crate) fn basename_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Vault".to_string())
+}
+
+/// In-memory migration applied on every [`load_settings`]: if the legacy
+/// `vault_path` is set and no `vaults` exist yet, convert it into a single
+/// active vault entry. The legacy field is always cleared afterward so it is
+/// never re-serialized. All other keys (`ai`, unknowns) are untouched.
+fn migrate(settings: &mut Settings) {
+    if settings.vaults.is_empty() {
+        if let Some(path) = settings.vault_path.take() {
+            if !path.trim().is_empty() {
+                let id = new_id();
+                settings.vaults.push(Vault {
+                    id: id.clone(),
+                    name: basename_of(&path),
+                    path,
+                    kind: VaultKind::Plain,
+                });
+                settings.active_vault_id = Some(id);
+            }
+        }
+    }
+    // Legacy key is fully superseded by `vaults`; never keep it around.
+    settings.vault_path = None;
+}
+
+/// Returns the active vault entry, if one is set and present in the list.
+pub(crate) fn active_vault(settings: &Settings) -> Option<&Vault> {
+    let id = settings.active_vault_id.as_ref()?;
+    settings.vaults.iter().find(|v| &v.id == id)
 }
 
 /// One node of the vault file tree sent to the frontend.
@@ -61,7 +151,10 @@ pub(crate) fn load_settings(app: &tauri::AppHandle) -> Result<Settings, String> 
     }
     let raw = fs::read_to_string(&path)
         .map_err(|e| format!("Could not read settings file: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("Settings file is not valid JSON: {e}"))
+    let mut settings: Settings =
+        serde_json::from_str(&raw).map_err(|e| format!("Settings file is not valid JSON: {e}"))?;
+    migrate(&mut settings);
+    Ok(settings)
 }
 
 pub(crate) fn save_settings(app: &tauri::AppHandle, settings: &Settings) -> Result<(), String> {
@@ -72,30 +165,30 @@ pub(crate) fn save_settings(app: &tauri::AppHandle, settings: &Settings) -> Resu
     }
     let raw = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Could not serialize settings: {e}"))?;
-    fs::write(&path, raw).map_err(|e| format!("Could not write settings file: {e}"))
+    // Atomic write so a crash or a Syncthing race can never leave a partial
+    // settings.json (which would wipe the vault list).
+    atomic_write(&path, raw.as_bytes())
 }
 
-/// Returns the canonicalized vault root, erroring if no vault is configured
-/// or the directory no longer exists.
+/// Returns the canonicalized active vault root, erroring if no vault is
+/// configured or the directory no longer exists (e.g. an offline drive).
 pub(crate) fn vault_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let settings = load_settings(app)?;
-    let raw = settings
-        .vault_path
-        .ok_or_else(|| "No vault is configured".to_string())?;
-    let root = PathBuf::from(&raw);
+    let vault = active_vault(&settings).ok_or_else(|| "No vault is configured".to_string())?;
+    let root = PathBuf::from(&vault.path);
     if !root.is_dir() {
-        return Err(format!("Vault directory no longer exists: {raw}"));
+        return Err(format!("Vault directory no longer exists: {}", vault.path));
     }
     root.canonicalize()
         .map_err(|e| format!("Could not resolve vault directory: {e}"))
 }
 
-/// Returns the canonicalized saved vault root if one is configured and still
+/// Returns the canonicalized active vault root if one is configured and still
 /// exists on disk, else `None`. Used by startup index initialization, where a
-/// missing/invalid vault should simply mean "no index" rather than an error.
+/// missing/offline vault should simply mean "no index" rather than an error.
 pub fn saved_vault_root(app: &tauri::AppHandle) -> Option<String> {
     let settings = load_settings(app).ok()?;
-    let root = PathBuf::from(settings.vault_path?);
+    let root = PathBuf::from(&active_vault(&settings)?.path);
     if !root.is_dir() {
         return None;
     }
@@ -268,18 +361,21 @@ pub async fn pick_vault(app: tauri::AppHandle) -> Result<Option<String>, String>
     }
 }
 
-/// Returns the saved vault path, or null if none is set (or the saved
-/// directory no longer exists).
+/// Returns the active vault's path, or null if none is set (or its directory
+/// no longer exists). A thin wrapper kept so untouched callers keep working;
+/// the vault switcher uses `list_vaults` instead.
 #[tauri::command]
 pub async fn get_vault(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let settings = load_settings(&app)?;
-    Ok(settings
-        .vault_path
+    Ok(active_vault(&settings)
+        .map(|v| v.path.clone())
         .filter(|p| Path::new(p).is_dir()))
 }
 
-/// Validates that `path` is an existing directory, persists it as the vault
-/// root in settings.json, and (re)opens the search index + file watcher for it.
+/// Adds `path` as a vault (or reuses an existing entry with the same canonical
+/// path), makes it active, and (re)opens the index + watcher for it. Kept as a
+/// thin wrapper over the multi-vault model so existing callers (e.g. the
+/// first-run "Open vault" flow) don't churn.
 #[tauri::command]
 pub async fn set_vault(
     app: tauri::AppHandle,
@@ -293,8 +389,29 @@ pub async fn set_vault(
     let canonical = dir
         .canonicalize()
         .map_err(|e| format!("Could not resolve directory: {e}"))?;
+    let canonical_str = canonical.to_string_lossy().into_owned();
+
     let mut settings = load_settings(&app)?;
-    settings.vault_path = Some(canonical.to_string_lossy().into_owned());
+    // Reuse an existing entry with the same canonical path, else create one.
+    let id = match settings
+        .vaults
+        .iter()
+        .find(|v| crate::vaults::same_path(&v.path, &canonical_str))
+    {
+        Some(v) => v.id.clone(),
+        None => {
+            let id = new_id();
+            let name = crate::vaults::dedup_name(&basename_of(&canonical_str), &settings.vaults);
+            settings.vaults.push(Vault {
+                id: id.clone(),
+                name,
+                path: canonical_str,
+                kind: VaultKind::Plain,
+            });
+            id
+        }
+    };
+    settings.active_vault_id = Some(id);
     save_settings(&app, &settings)?;
 
     // Swap the index/watcher over to the new vault. A failure here is
@@ -562,7 +679,7 @@ pub async fn save_attachment(
     // Register the write so the watcher ignores it. Harmless: the watcher skips
     // non-.md files anyway, but this keeps the suppression path uniform.
     register_write(&state.recent_writes, &rel);
-    fs::write(&path, &data).map_err(|e| format!("Could not write attachment '{rel}': {e}"))?;
+    atomic_write(&path, &data)?;
     Ok(rel)
 }
 
@@ -581,6 +698,39 @@ pub async fn reveal_in_finder(app: tauri::AppHandle, rel_path: String) -> Result
 // ---------------------------------------------------------------------------
 // Index helper
 // ---------------------------------------------------------------------------
+
+/// Atomically writes `bytes` to `path`.
+///
+/// Writes to a uniquely-named temp file in the **same directory** (so the
+/// rename stays on one filesystem and is therefore atomic), then renames it
+/// over `path`. A partially-written file can never be observed by a reader or
+/// by Syncthing — they see either the old contents or the complete new ones.
+/// The temp file is dot-prefixed so the vault scanner and watcher ignore it,
+/// and it is removed if the write or rename fails so no `.tmp` litter remains.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Cannot write to a path with no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("Cannot write to a path with no file name: {}", path.display()))?;
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{file_name}.tmp-{}-{n}", std::process::id()));
+
+    if let Err(e) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Could not write '{}': {e}", path.display()));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Could not finalize write to '{}': {e}", path.display()));
+    }
+    Ok(())
+}
 
 /// Upserts a single note into the search index, if one is open. Best-effort:
 /// an indexing failure never fails the underlying file operation.
@@ -616,7 +766,7 @@ pub(crate) fn write_note_at(
             .map_err(|e| format!("Could not create parent folders: {e}"))?;
     }
     register_write(&state.recent_writes, rel);
-    fs::write(&path, content).map_err(|e| format!("Could not write note '{rel}': {e}"))?;
+    atomic_write(&path, content.as_bytes())?;
     index_upsert(state, rel, content);
     Ok(())
 }
@@ -653,7 +803,7 @@ pub(crate) fn create_note_exact(
     }
     let created_rel = to_rel_string(root, &path)?;
     register_write(&state.recent_writes, &created_rel);
-    fs::write(&path, content).map_err(|e| format!("Could not create note '{created_rel}': {e}"))?;
+    atomic_write(&path, content.as_bytes())?;
     index_upsert(state, &created_rel, content);
     Ok(created_rel)
 }
@@ -922,6 +1072,84 @@ mod tests {
         // No extension at all.
         assert!(sanitize_attachment_name("noext").is_err());
         assert!(sanitize_attachment_name("trailingdot.").is_err());
+    }
+
+    #[test]
+    fn migrate_converts_legacy_vault_path_and_preserves_ai_key() {
+        // A legacy settings.json shape: single `vaultPath`, plus an `ai` block
+        // and an unknown future key that must both survive untouched.
+        let raw = r#"{
+            "vaultPath": "/Users/jay/MyVault",
+            "ai": { "preset": "custom", "apiKey": "secret" },
+            "futureThing": { "keep": true }
+        }"#;
+        let mut settings: Settings = serde_json::from_str(raw).unwrap();
+        migrate(&mut settings);
+
+        // Legacy key is gone; exactly one active vault took its place.
+        assert!(settings.vault_path.is_none());
+        assert_eq!(settings.vaults.len(), 1);
+        let v = &settings.vaults[0];
+        assert_eq!(v.name, "MyVault");
+        assert_eq!(v.path, "/Users/jay/MyVault");
+        assert_eq!(v.kind, VaultKind::Plain);
+        assert_eq!(settings.active_vault_id.as_deref(), Some(v.id.as_str()));
+
+        // Unknown keys (ai, futureThing) are preserved verbatim.
+        assert_eq!(
+            settings.extra.get("ai").and_then(|v| v.get("preset")),
+            Some(&serde_json::json!("custom"))
+        );
+        assert_eq!(
+            settings.extra.get("futureThing"),
+            Some(&serde_json::json!({ "keep": true }))
+        );
+
+        // Round-trips without resurrecting the legacy key and stays stable.
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("vaultPath"));
+        let mut again: Settings = serde_json::from_str(&json).unwrap();
+        let before = again.vaults.clone();
+        migrate(&mut again);
+        assert_eq!(again.vaults, before, "migration is idempotent");
+    }
+
+    #[test]
+    fn migrate_noop_when_vaults_already_present() {
+        // A settings file already on the new schema is left alone.
+        let raw = r#"{
+            "vaults": [{ "id": "abc", "name": "V", "path": "/v", "kind": "plain" }],
+            "activeVaultId": "abc"
+        }"#;
+        let mut settings: Settings = serde_json::from_str(raw).unwrap();
+        migrate(&mut settings);
+        assert_eq!(settings.vaults.len(), 1);
+        assert_eq!(settings.vaults[0].id, "abc");
+        assert_eq!(settings.active_vault_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn atomic_write_writes_content_and_leaves_no_tmp() {
+        let dir = make_temp_dir("atomic");
+        let path = dir.join("note.md");
+
+        atomic_write(&path, b"hello world").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello world");
+
+        // Overwrite in place.
+        atomic_write(&path, b"second version").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second version");
+
+        // No `.tmp` litter remains after successful writes.
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected temp files: {leftovers:?}");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

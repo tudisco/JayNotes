@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { get, writable } from "svelte/store";
+import { derived, get, writable } from "svelte/store";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -22,6 +22,31 @@ export interface ContextMenuState {
   x: number;
   y: number;
   node: TreeNode;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-vault types (M13)
+// ---------------------------------------------------------------------------
+
+/** Vault kind. `"plain"` is the only kind in M13; M14 adds `"encrypted"`. */
+export type VaultKind = "plain";
+
+/** On-disk status of a vault folder, mirrored from the Rust `VaultStatus`. */
+export type VaultStatus = "ok" | "offline" | "missing";
+
+export interface VaultInfo {
+  id: string;
+  name: string;
+  path: string;
+  kind: VaultKind;
+  status: VaultStatus;
+}
+
+/** Payload of the `list_vaults` command. */
+export interface VaultList {
+  vaults: VaultInfo[];
+  activeId: string | null;
+  removed: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -53,16 +78,57 @@ export const vaultLoading = writable(true);
 export const vaultError = writable<string | null>(null);
 
 // ---------------------------------------------------------------------------
+// Multi-vault state (M13)
+// ---------------------------------------------------------------------------
+
+/** All configured vaults with live status. */
+export const vaults = writable<VaultInfo[]>([]);
+
+/** Id of the active vault, or null when none is configured. */
+export const activeVaultId = writable<string | null>(null);
+
+/**
+ * Names of vaults auto-removed (status "missing") on the last `list_vaults`.
+ * Drives the one-time dismissable notice; cleared by `dismissRemovedNotice`.
+ */
+export const removedVaultNames = writable<string[]>([]);
+
+/**
+ * True when the active vault's folder is currently unreachable because its
+ * drive is unplugged (status "offline"). The UI shows a retry state rather
+ * than the tree, and never auto-removes the vault.
+ */
+export const activeVaultOffline = writable(false);
+
+/** The active vault object, derived from `vaults` + `activeVaultId`. */
+export const activeVault = derived(
+  [vaults, activeVaultId],
+  ([$vaults, $activeVaultId]) =>
+    $vaults.find((v) => v.id === $activeVaultId) ?? null,
+);
+
+function currentActiveVault(): VaultInfo | null {
+  const id = get(activeVaultId);
+  return get(vaults).find((v) => v.id === id) ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Vault lifecycle
 // ---------------------------------------------------------------------------
 
-/** Called once on app start: restores the saved vault and scans it. */
+/** Called once on app start: loads the vault list and opens the active one. */
 export async function initVault(): Promise<void> {
   try {
-    const path = await invoke<string | null>("get_vault");
-    if (path) {
-      vaultPath.set(path);
+    await loadVaults();
+    const active = currentActiveVault();
+    if (active && active.status === "ok") {
+      vaultPath.set(active.path);
+      activeVaultOffline.set(false);
       await refreshTree();
+    } else {
+      vaultPath.set(null);
+      fileTree.set(null);
+      activeVaultOffline.set(!!active && active.status === "offline");
     }
   } catch (e) {
     vaultError.set(String(e));
@@ -71,19 +137,96 @@ export async function initVault(): Promise<void> {
   }
 }
 
-/** Opens the native folder picker, persists the choice, and scans. */
-export async function openVault(): Promise<void> {
-  try {
-    const picked = await invoke<string | null>("pick_vault");
-    if (!picked) return;
-    await invoke("set_vault", { path: picked });
-    vaultPath.set(picked);
+/**
+ * Fetches the vault list (which also prunes any "missing" vaults on the Rust
+ * side and reports their names). Updates the vault/active stores and records
+ * removals for the one-time notice.
+ */
+export async function loadVaults(): Promise<VaultList> {
+  const list = await invoke<VaultList>("list_vaults");
+  vaults.set(list.vaults);
+  activeVaultId.set(list.activeId);
+  if (list.removed.length > 0) {
+    removedVaultNames.update((prev) => [...prev, ...list.removed]);
+  }
+  return list;
+}
+
+/** Dismisses the "removed missing vault" notice. */
+export function dismissRemovedNotice(): void {
+  removedVaultNames.set([]);
+}
+
+/**
+ * Switches the active vault: clears selection/expanded/tree, re-inits the
+ * backend index+watcher, then rescans. Throws (leaving state intact) if the
+ * target vault is unreachable.
+ */
+export async function switchVault(id: string): Promise<void> {
+  const path = await invoke<string>("switch_vault", { id });
+  vaultPath.set(path);
+  activeVaultOffline.set(false);
+  selected.set(null);
+  expandedDirs.set(new Set());
+  fileTree.set(null);
+  await loadVaults();
+  await refreshTree();
+}
+
+/**
+ * Opens the folder picker, adds the chosen folder as a new vault, and switches
+ * to it. Returns the new vault id, or null if the picker was cancelled.
+ */
+export async function addVault(): Promise<string | null> {
+  const picked = await invoke<string | null>("pick_vault");
+  if (!picked) return null;
+  const vault = await invoke<VaultInfo>("add_vault", { path: picked });
+  await switchVault(vault.id);
+  return vault.id;
+}
+
+/**
+ * Creates a new vault folder named `name` under `parentPath` and switches to
+ * it. Returns the new vault id.
+ */
+export async function createVault(
+  parentPath: string,
+  name: string,
+): Promise<string> {
+  const vault = await invoke<VaultInfo>("create_vault", { parentPath, name });
+  await switchVault(vault.id);
+  return vault.id;
+}
+
+/**
+ * Forgets a vault (never touches the folder on disk). If it was the active
+ * vault, the backend switches to the first remaining one; this reflects that in
+ * the UI, resetting selection/tree as needed.
+ */
+export async function removeVault(id: string): Promise<void> {
+  const wasActive = get(activeVaultId) === id;
+  await invoke<string | null>("remove_vault", { id });
+  await loadVaults();
+  if (wasActive) {
+    const active = currentActiveVault();
     selected.set(null);
     expandedDirs.set(new Set());
-    await refreshTree();
-  } catch (e) {
-    vaultError.set(String(e));
+    if (active && active.status === "ok") {
+      vaultPath.set(active.path);
+      activeVaultOffline.set(false);
+      await refreshTree();
+    } else {
+      vaultPath.set(null);
+      fileTree.set(null);
+      activeVaultOffline.set(!!active && active.status === "offline");
+    }
   }
+}
+
+/** Renames a vault's display name only (the folder is untouched). */
+export async function renameVault(id: string, name: string): Promise<void> {
+  await invoke("rename_vault", { id, name });
+  await loadVaults();
 }
 
 /** Re-scans the vault and updates the tree. */

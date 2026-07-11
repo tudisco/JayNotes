@@ -36,6 +36,9 @@ export function toggleFilesView(): void {
 /** Whether the Cmd+P quick switcher modal is open. */
 export const quickSwitcherOpen = writable(false);
 
+/** Whether the header vault-switcher popover is open (also openable from Settings). */
+export const vaultSwitcherOpen = writable(false);
+
 const CHAT_OPEN_KEY = "jaynotes:chatOpen";
 
 function initialChatOpen(): boolean {

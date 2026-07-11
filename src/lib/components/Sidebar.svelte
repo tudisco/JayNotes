@@ -1,10 +1,16 @@
 <script lang="ts">
   import {
+    activeVault,
+    addVault,
+    dismissRemovedNotice,
     fileTree,
+    initVault,
     newFolder,
     newItemTargetDir,
     newNote,
-    openVault,
+    activeVaultOffline,
+    removedVaultNames,
+    switchVault,
     vaultError,
     vaultLoading,
     vaultPath,
@@ -15,6 +21,7 @@
   import SearchPanel from "./SearchPanel.svelte";
   import TagsPanel from "./TagsPanel.svelte";
   import SettingsMenu from "./SettingsMenu.svelte";
+  import VaultSwitcher from "./VaultSwitcher.svelte";
   import {
     sidebarMode,
     searchFocusNonce,
@@ -50,12 +57,50 @@
       vaultError.set(String(e));
     }
   }
+
+  async function handleOpenVault(): Promise<void> {
+    try {
+      await addVault();
+    } catch (e) {
+      vaultError.set(String(e));
+    }
+  }
+
+  async function retryOffline(): Promise<void> {
+    const v = $activeVault;
+    if (!v) return;
+    try {
+      await switchVault(v.id);
+    } catch (e) {
+      // Still offline: re-check statuses so the row/label stay accurate.
+      await initVault();
+      vaultError.set(String(e));
+    }
+  }
 </script>
 
 <aside class="sidebar">
-  <div class="brand">
-    <span class="brand-name">JayNotes</span>
-  </div>
+  <VaultSwitcher />
+
+  {#if $removedVaultNames.length > 0}
+    <div class="notice" role="status">
+      <span class="notice-text">
+        {#if $removedVaultNames.length === 1}
+          Removed vault “{$removedVaultNames[0]}” — folder no longer exists.
+        {:else}
+          Removed {$removedVaultNames.length} vaults — folders no longer exist.
+        {/if}
+      </span>
+      <button
+        type="button"
+        class="notice-dismiss"
+        aria-label="Dismiss"
+        onclick={dismissRemovedNotice}
+      >
+        ✕
+      </button>
+    </div>
+  {/if}
 
   {#if $vaultPath}
     <div class="tabs" role="tablist" aria-label="Sidebar view">
@@ -225,10 +270,19 @@
 
     {#if $vaultLoading}
       <div class="empty-tree">Loading…</div>
+    {:else if $activeVaultOffline && $activeVault}
+      <div class="empty-tree">
+        <p>
+          Vault “{$activeVault.name}” is offline — is the drive connected?
+        </p>
+        <button type="button" class="open-vault-btn" onclick={retryOffline}>
+          Retry
+        </button>
+      </div>
     {:else if !$vaultPath}
       <div class="empty-tree">
         <p>Open a vault to get started</p>
-        <button type="button" class="open-vault-btn" onclick={openVault}>
+        <button type="button" class="open-vault-btn" onclick={handleOpenVault}>
           Open Vault
         </button>
       </div>
@@ -266,16 +320,36 @@
     border-right: 1px solid var(--border);
   }
 
-  .brand {
-    padding: 16px 16px 12px;
-    border-bottom: 1px solid var(--border);
+  .notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background-color: var(--bg-panel);
+    font-size: 12px;
+    color: var(--text-muted);
   }
 
-  .brand-name {
-    font-size: 16px;
-    font-weight: 600;
+  .notice-text {
+    flex: 1;
+    line-height: 1.4;
+  }
+
+  .notice-dismiss {
+    flex-shrink: 0;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 0 2px;
+  }
+
+  .notice-dismiss:hover {
     color: var(--text);
-    letter-spacing: -0.01em;
   }
 
   .tabs {

@@ -4,7 +4,7 @@
   Renders a single footer button that opens a small popover (upward, since the
   footer sits at the bottom) with:
     - theme cycle (reuses the shared theme store)
-    - "Change vault…" (confirm → pick_vault → set_vault → rescan, via openVault)
+    - "Manage vaults…" (opens the header vault switcher popover)
     - "Rebuild index" (reindex_vault) with transient status
     - the app version
 
@@ -16,7 +16,8 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { themeMode, cycleTheme, type ThemeMode } from "$lib/stores/theme";
-  import { openVault, vaultError, vaultPath } from "$lib/stores/vault";
+  import { vaultError, vaultPath } from "$lib/stores/vault";
+  import { vaultSwitcherOpen } from "$lib/stores/ui";
 
   const themeLabels: Record<ThemeMode, string> = {
     light: "Light",
@@ -30,7 +31,6 @@
   };
 
   let open = $state(false);
-  let confirmingVault = $state(false);
   let reindexStatus = $state<"idle" | "running" | "done" | "error">("idle");
   let version = $state("");
 
@@ -44,21 +44,15 @@
 
   function toggle(): void {
     open = !open;
-    if (!open) confirmingVault = false;
   }
 
   function close(): void {
     open = false;
-    confirmingVault = false;
   }
 
-  async function changeVault(): Promise<void> {
+  function manageVaults(): void {
     close();
-    try {
-      await openVault();
-    } catch (e) {
-      vaultError.set(String(e));
-    }
+    vaultSwitcherOpen.set(true);
   }
 
   async function rebuildIndex(): Promise<void> {
@@ -104,34 +98,15 @@
 
       <div class="separator"></div>
 
-      {#if confirmingVault}
-        <div class="confirm">
-          <p class="confirm-text">Switch to a different vault folder?</p>
-          <div class="confirm-actions">
-            <button type="button" class="confirm-btn primary" onclick={changeVault}>
-              Choose folder…
-            </button>
-            <button
-              type="button"
-              class="confirm-btn"
-              onclick={() => (confirmingVault = false)}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      {:else}
-        <button
-          type="button"
-          class="menu-item"
-          role="menuitem"
-          disabled={!$vaultPath}
-          onclick={() => (confirmingVault = true)}
-        >
-          <span class="menu-icon">⇄</span>
-          <span class="menu-label">Change vault…</span>
-        </button>
-      {/if}
+      <button
+        type="button"
+        class="menu-item"
+        role="menuitem"
+        onclick={manageVaults}
+      >
+        <span class="menu-icon">⇄</span>
+        <span class="menu-label">Manage vaults…</span>
+      </button>
 
       <button
         type="button"
@@ -270,47 +245,5 @@
     padding: 6px 8px 4px;
     font-size: 11px;
     color: var(--text-muted);
-  }
-
-  .confirm {
-    padding: 6px 8px 8px;
-  }
-
-  .confirm-text {
-    margin: 0 0 8px;
-    font-size: 12px;
-    color: var(--text);
-    line-height: 1.4;
-  }
-
-  .confirm-actions {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  .confirm-btn {
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    background-color: var(--bg-panel);
-    color: var(--text);
-    font-size: 12px;
-    font-family: var(--font-ui);
-    cursor: pointer;
-  }
-
-  .confirm-btn:hover {
-    background-color: var(--hover);
-  }
-
-  .confirm-btn.primary {
-    border-color: transparent;
-    background-color: var(--accent);
-    color: var(--accent-contrast);
-  }
-
-  .confirm-btn.primary:hover {
-    background-color: var(--accent-hover);
   }
 </style>

@@ -2,6 +2,7 @@ mod ai;
 mod index;
 mod pdf;
 mod vault;
+mod vaults;
 mod watcher;
 
 use std::path::Path;
@@ -36,6 +37,12 @@ pub fn run() {
             vault::pick_vault,
             vault::get_vault,
             vault::set_vault,
+            vaults::list_vaults,
+            vaults::add_vault,
+            vaults::create_vault,
+            vaults::remove_vault,
+            vaults::rename_vault,
+            vaults::switch_vault,
             vault::scan_vault,
             vault::read_note,
             vault::write_note,
