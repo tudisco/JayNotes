@@ -107,6 +107,12 @@ rusqlite + FTS5 schema above. Full scan on vault open, incremental by mtime. Rei
 **M6 — Polish & basic wikilinks**
 Dark mode pass over every surface. Keyboard shortcuts (Cmd+N, Cmd+P, Cmd+Shift+F, Cmd+, theme toggle). Minimal wikilinks: `[[Note Name]]` rendered as a link in the editor, click navigates (resolve via index by title/path); autocomplete popup can come later. App icon + `tauri build` to produce the .app.
 
+**M7 — Local image support** *(added 2026-07-10 after v1 shipped)*
+Paste or drag an image into the editor → saved as a real file under `attachments/` in the vault (Rust `save_attachment` command: sanitized, uniquified name), inserting a standard relative `![](attachments/…)` link so files stay Obsidian-portable. Rendering via Tauri asset protocol (vault dir allowed at runtime on vault open) + Crepe `proxyDomURL` resolving relative paths to asset URLs for display only. `dragDropEnabled: false` on the window so HTML5 drops reach ProseMirror. Remote https images keep working.
+
+**M8 — Tags panel** *(added 2026-07-10 after v1 shipped)*
+Third sidebar tab "Tags" next to Files/Search: `list_tags()` Rust command (tag + note count from the tags table), tag list with counts, click a tag → notes carrying it (reuses `tag:` search), click note opens. Refreshes on vault-changed events.
+
 ## Verification
 
 - Each milestone: run `npm run tauri dev` and exercise the feature by hand (create/edit/search notes).
