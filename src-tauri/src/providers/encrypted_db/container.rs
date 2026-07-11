@@ -1196,4 +1196,32 @@ mod tests {
         std::fs::remove_file(&base).ok();
         std::fs::remove_file(&snap).ok();
     }
+
+    #[test]
+    fn both_sides_changed_keeps_loser_as_conflict_copy() {
+        let base = tmp_path("conf-base");
+        let snap = tmp_path("conf-snap");
+        let k = key();
+        let c = Container::create(&base, &k, "V").unwrap();
+        c.write_note("a.md", "v1").unwrap();
+        c.export_snapshot(&snap).unwrap();
+
+        // Edit locally first, then a newer remote edit lands in the snapshot.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        c.write_note("a.md", "local-edit").unwrap();
+        {
+            let other = Container::open(&snap, &k).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            other.write_note("a.md", "remote-edit").unwrap();
+        }
+        c.import_from(&snap, &k, "2026-07-11").unwrap();
+        // Newer remote wins the primary path; the local loser is preserved.
+        assert_eq!(c.read_note("a.md").unwrap(), "remote-edit");
+        assert_eq!(
+            c.read_note("a (conflict 2026-07-11).md").unwrap(),
+            "local-edit"
+        );
+        std::fs::remove_file(&base).ok();
+        std::fs::remove_file(&snap).ok();
+    }
 }
