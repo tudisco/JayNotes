@@ -3,7 +3,7 @@
 import { writable } from "svelte/store";
 
 /** Which view the sidebar shows below its tab strip. */
-export type SidebarMode = "files" | "search";
+export type SidebarMode = "files" | "search" | "tags";
 
 export const sidebarMode = writable<SidebarMode>("files");
 

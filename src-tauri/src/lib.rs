@@ -44,6 +44,8 @@ pub fn run() {
             index::index_status,
             index::search_notes,
             index::list_notes,
+            index::list_tags,
+            index::notes_by_tag,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

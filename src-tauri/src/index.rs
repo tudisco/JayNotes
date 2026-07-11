@@ -494,6 +494,14 @@ pub struct NoteRef {
     pub mtime: i64,
 }
 
+/// A distinct tag with the number of notes carrying it. Powers the Tags panel.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCount {
+    pub tag: String,
+    pub count: u32,
+}
+
 impl Index {
     /// Opens (or creates) the index database at `db_path` for `vault_root`,
     /// rebuilding the schema if the stored version doesn't match.
@@ -1035,6 +1043,72 @@ impl Index {
             .map_err(|e| format!("Could not read note row: {e}"))
     }
 
+    /// Every distinct tag with its note count, sorted alphabetically
+    /// (case-insensitive). Powers the Tags panel. The `tags` PK `(note_id, tag)`
+    /// already guarantees a note is counted at most once per tag.
+    pub fn list_tags(&self) -> Result<Vec<TagCount>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT tag, COUNT(*) FROM tags \
+                 GROUP BY tag ORDER BY tag COLLATE NOCASE ASC, tag ASC",
+            )
+            .map_err(|e| format!("Could not prepare tag list: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(TagCount {
+                    tag: r.get(0)?,
+                    count: r.get::<_, i64>(1)? as u32,
+                })
+            })
+            .map_err(|e| format!("Could not list tags: {e}"))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| format!("Could not read tag row: {e}"))
+    }
+
+    /// Notes carrying exactly `tag` (an exact, case-sensitive match against the
+    /// stored tag), returned in the `SearchHit` shape sorted by title. The
+    /// snippet is the leading ~100 chars of body with no `<mark>` marks. This
+    /// bypasses the search query parser so tags containing whitespace or other
+    /// query punctuation round-trip faithfully.
+    pub fn notes_by_tag(&self, tag: &str, limit: u32) -> Result<Vec<SearchHit>, String> {
+        let limit = limit as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT n.id, n.path, n.title, substr(b.body, 1, 100), length(b.body) \
+                 FROM notes n \
+                 JOIN notes_fts b ON b.rowid = n.id \
+                 JOIN tags t ON t.note_id = n.id \
+                 WHERE t.tag = ?1 \
+                 ORDER BY n.title COLLATE NOCASE ASC LIMIT ?2",
+            )
+            .map_err(|e| format!("Could not prepare notes-by-tag: {e}"))?;
+        let raw: Vec<(i64, String, String, String, i64)> = stmt
+            .query_map(params![tag, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map_err(|e| format!("Could not run notes-by-tag: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("Could not read notes-by-tag row: {e}"))?;
+
+        let mut hits = Vec::with_capacity(raw.len());
+        for (id, path, title, mut body_prefix, body_len) in raw {
+            if body_len > 100 {
+                body_prefix.push('…');
+            }
+            let tags = self.tags_for(id)?;
+            hits.push(SearchHit {
+                path,
+                title,
+                snippet: body_prefix,
+                score: 0.0,
+                tags,
+            });
+        }
+        Ok(hits)
+    }
+
     /// Reads `(mtime_secs, size)` for a vault-relative note, if it exists.
     fn stat(&self, rel: &str) -> Option<(i64, i64)> {
         let abs = self.vault_root.join(rel);
@@ -1166,6 +1240,26 @@ pub async fn list_notes(state: tauri::State<'_, AppState>) -> Result<Vec<NoteRef
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("No vault is indexed")?;
     index.list_notes()
+}
+
+/// Lists every distinct tag with its note count, sorted alphabetically.
+#[tauri::command]
+pub async fn list_tags(state: tauri::State<'_, AppState>) -> Result<Vec<TagCount>, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("No vault is indexed")?;
+    index.list_tags()
+}
+
+/// Lists notes carrying exactly `tag`, sorted by title. `limit` defaults to 500.
+#[tauri::command]
+pub async fn notes_by_tag(
+    state: tauri::State<'_, AppState>,
+    tag: String,
+    limit: Option<u32>,
+) -> Result<Vec<SearchHit>, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("No vault is indexed")?;
+    index.notes_by_tag(&tag, limit.unwrap_or(500))
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,6 +1776,157 @@ Duplicate #alpha stays once.";
             vec!["new.md", "mid.md", "old.md"]
         );
         assert_eq!(notes[0].title, "new");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- tags panel ----
+
+    #[test]
+    fn list_tags_counts_and_alphabetical_order() {
+        let root = make_temp_dir("list-tags");
+        let index = mem_index(&root);
+        index
+            .index_file("a.md", "---\ntags: [project, Alpha]\n---\nBody #beta")
+            .unwrap();
+        index
+            .index_file("b.md", "---\ntags: [project]\n---\nBody #beta")
+            .unwrap();
+        index.index_file("c.md", "# C\nNo tags here.").unwrap();
+
+        let tags = index.list_tags().unwrap();
+        // Case-insensitive alphabetical: Alpha, beta, project.
+        assert_eq!(
+            tags,
+            vec![
+                TagCount { tag: "Alpha".into(), count: 1 },
+                TagCount { tag: "beta".into(), count: 2 },
+                TagCount { tag: "project".into(), count: 2 },
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_tags_empty_vault_is_empty() {
+        let root = make_temp_dir("list-tags-empty");
+        let index = mem_index(&root);
+        assert!(index.list_tags().unwrap().is_empty());
+        // A note with no tags still yields no tags.
+        index.index_file("a.md", "# A\nPlain body.").unwrap();
+        assert!(index.list_tags().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_tags_dedups_within_a_note() {
+        let root = make_temp_dir("list-tags-dedup");
+        let index = mem_index(&root);
+        // Same tag in frontmatter and inline must count the note once.
+        index
+            .index_file("a.md", "---\ntags: [dup]\n---\nBody #dup and #dup again.")
+            .unwrap();
+        let tags = index.list_tags().unwrap();
+        assert_eq!(tags, vec![TagCount { tag: "dup".into(), count: 1 }]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_tags_updates_after_tag_removal_on_reindex() {
+        let root = make_temp_dir("list-tags-reindex");
+        let index = mem_index(&root);
+        index
+            .index_file("a.md", "---\ntags: [keep, drop]\n---\nBody")
+            .unwrap();
+        index.index_file("b.md", "---\ntags: [keep]\n---\nBody").unwrap();
+        assert_eq!(
+            index.list_tags().unwrap(),
+            vec![
+                TagCount { tag: "drop".into(), count: 1 },
+                TagCount { tag: "keep".into(), count: 2 },
+            ]
+        );
+
+        // Re-index a.md without the `drop` tag: it should vanish from the list.
+        index
+            .index_file("a.md", "---\ntags: [keep]\n---\nBody")
+            .unwrap();
+        assert_eq!(
+            index.list_tags().unwrap(),
+            vec![TagCount { tag: "keep".into(), count: 2 }]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_by_tag_returns_hits_sorted_by_title() {
+        let root = make_temp_dir("notes-by-tag");
+        let index = mem_index(&root);
+        index
+            .index_file("zebra.md", "---\ntags: [topic]\n---\nZebra body content.")
+            .unwrap();
+        index
+            .index_file("apple.md", "---\ntags: [topic]\n---\nApple body content.")
+            .unwrap();
+        index
+            .index_file("other.md", "---\ntags: [misc]\n---\nOther body.")
+            .unwrap();
+
+        let hits = index.notes_by_tag("topic", 500).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["apple.md", "zebra.md"]
+        );
+        // Snippet is plain body text, no marks; score 0.
+        assert!(!hits[0].snippet.contains("<mark>"));
+        assert!(hits[0].snippet.starts_with("Apple body"));
+        assert_eq!(hits[0].score, 0.0);
+        assert!(hits[0].tags.contains(&"topic".to_string()));
+
+        // A tag no note carries yields nothing.
+        assert!(index.notes_by_tag("nope", 500).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_by_tag_matches_tags_with_spaces_exactly() {
+        let root = make_temp_dir("notes-by-tag-spaces");
+        let index = mem_index(&root);
+        // A frontmatter tag can contain spaces (inline `#tags` cannot).
+        index
+            .index_file("a.md", "---\ntags: ['two words']\n---\nBody")
+            .unwrap();
+        index
+            .index_file("b.md", "---\ntags: [two]\n---\nBody")
+            .unwrap();
+
+        // Exact match on the spaced tag returns only a.md — the query parser
+        // (whitespace-splitting) could never express this.
+        let hits = index.notes_by_tag("two words", 500).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "a.md");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn notes_by_tag_long_body_snippet_is_truncated() {
+        let root = make_temp_dir("notes-by-tag-snip");
+        let index = mem_index(&root);
+        let long = "x".repeat(200);
+        index
+            .index_file("a.md", &format!("---\ntags: [t]\n---\n{long}"))
+            .unwrap();
+        let hits = index.notes_by_tag("t", 500).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.ends_with('…'));
+        // 100 body chars + the ellipsis.
+        assert_eq!(hits[0].snippet.chars().count(), 101);
 
         std::fs::remove_dir_all(&root).ok();
     }

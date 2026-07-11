@@ -12,6 +12,7 @@
   import FileTree from "./FileTree.svelte";
   import ContextMenu from "./ContextMenu.svelte";
   import SearchPanel from "./SearchPanel.svelte";
+  import TagsPanel from "./TagsPanel.svelte";
   import SettingsMenu from "./SettingsMenu.svelte";
   import { sidebarMode, searchFocusNonce } from "$lib/stores/ui";
 
@@ -22,6 +23,10 @@
   function showSearch(): void {
     sidebarMode.set("search");
     searchFocusNonce.update((n) => n + 1);
+  }
+
+  function showTags(): void {
+    sidebarMode.set("tags");
   }
 
   async function handleNewNote(): Promise<void> {
@@ -96,12 +101,35 @@
         </svg>
         <span>Search</span>
       </button>
+      <button
+        type="button"
+        role="tab"
+        class="tab"
+        class:active={$sidebarMode === "tags"}
+        aria-selected={$sidebarMode === "tags"}
+        title="Tags"
+        onclick={showTags}
+      >
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+          <path
+            d="M2.5 2.5h4.2a1 1 0 0 1 .7.3l6 6a1 1 0 0 1 0 1.4l-3.5 3.5a1 1 0 0 1-1.4 0l-6-6a1 1 0 0 1-.3-.7V3.5a1 1 0 0 1 1-1z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linejoin="round"
+          />
+          <circle cx="5.2" cy="5.2" r="1.05" fill="currentColor" />
+        </svg>
+        <span>Tags</span>
+      </button>
     </div>
   {/if}
 
   <nav class="notes">
     {#if $vaultPath && $sidebarMode === "search"}
       <SearchPanel />
+    {:else if $vaultPath && $sidebarMode === "tags"}
+      <TagsPanel />
     {:else}
     <div class="section-header">
       <span class="section-label">Notes</span>

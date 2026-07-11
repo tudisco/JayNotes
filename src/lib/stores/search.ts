@@ -20,10 +20,26 @@ export interface NoteRef {
   mtime: number;
 }
 
+/** A distinct tag with its note count. Mirrors `TagCount` in `index.rs`. */
+export interface TagCount {
+  tag: string;
+  count: number;
+}
+
 export function searchNotes(query: string, limit?: number): Promise<SearchHit[]> {
   return invoke<SearchHit[]>("search_notes", { query, limit });
 }
 
 export function listNotes(): Promise<NoteRef[]> {
   return invoke<NoteRef[]>("list_notes");
+}
+
+/** Every distinct tag with its note count, sorted alphabetically. */
+export function listTags(): Promise<TagCount[]> {
+  return invoke<TagCount[]>("list_tags");
+}
+
+/** Notes carrying exactly `tag`, in the `SearchHit` shape, sorted by title. */
+export function notesByTag(tag: string, limit?: number): Promise<SearchHit[]> {
+  return invoke<SearchHit[]>("notes_by_tag", { tag, limit });
 }
