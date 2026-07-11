@@ -1,0 +1,108 @@
+/* Milkdown Crepe theming for JayNotes.
+ *
+ * We load Crepe's structural styles (common) plus the "frame" theme (which
+ * defines the --crepe-color-* / --crepe-font-* custom properties), then remap
+ * those properties onto our own design tokens. Because our tokens are already
+ * theme-aware (:root for light, [data-theme="dark"] for dark), this single
+ * mapping block themes the editor correctly in BOTH modes — no separate dark
+ * override of the Crepe variables is needed.
+ */
+
+@import "@milkdown/crepe/theme/common/style.css";
+@import "@milkdown/crepe/theme/frame.css";
+
+.milkdown {
+  /* Surfaces & text */
+  --crepe-color-background: var(--bg-panel);
+  --crepe-color-on-background: var(--text);
+  --crepe-color-surface: var(--code-bg);
+  --crepe-color-surface-low: var(--code-bg);
+  --crepe-color-on-surface: var(--text);
+  --crepe-color-on-surface-variant: var(--text-muted);
+  --crepe-color-outline: var(--border);
+
+  /* Accents */
+  --crepe-color-primary: var(--accent);
+  --crepe-color-secondary: var(--border);
+  --crepe-color-on-secondary: var(--text);
+  --crepe-color-inverse: var(--text);
+  --crepe-color-on-inverse: var(--bg-panel);
+  --crepe-color-inline-code: var(--accent);
+  --crepe-color-error: #ef4444;
+
+  /* Interaction states */
+  --crepe-color-hover: var(--code-bg);
+  --crepe-color-selected: color-mix(in srgb, var(--accent) 22%, transparent);
+  --crepe-color-inline-area: var(--code-bg);
+
+  /* Typography */
+  --crepe-font-title: var(--font-content);
+  --crepe-font-default: var(--font-content);
+  --crepe-font-code: var(--font-mono);
+
+  background-color: var(--bg-panel);
+  color: var(--text);
+  font-family: var(--font-content);
+}
+
+/* Content column: Obsidian/Notion-style comfortable centered measure. */
+.milkdown .ProseMirror {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 8px 16px 40vh;
+  font-family: var(--font-content);
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--text);
+  caret-color: var(--accent);
+}
+
+.milkdown .ProseMirror :is(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--font-content);
+  color: var(--text);
+}
+
+/* Text selection uses our accent tint. */
+.milkdown .ProseMirror ::selection {
+  background-color: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* Links */
+.milkdown .ProseMirror a {
+  color: var(--accent);
+  text-decoration-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+/* Inline code */
+.milkdown .ProseMirror code:not(pre code) {
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background-color: var(--code-bg);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+/* Blockquotes */
+.milkdown .ProseMirror blockquote {
+  border-left: 3px solid var(--accent);
+  color: var(--text-muted);
+}
+
+/* Fenced code blocks (CodeMirror): mono font, subtle surface, rounded. */
+.milkdown .milkdown-code-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background-color: var(--code-bg);
+  font-family: var(--font-mono);
+}
+
+.milkdown .milkdown-code-block .cm-editor,
+.milkdown .milkdown-code-block .cm-gutters {
+  background-color: var(--code-bg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.milkdown .milkdown-code-block .cm-content {
+  caret-color: var(--accent);
+}

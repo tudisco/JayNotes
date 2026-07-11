@@ -220,6 +220,33 @@ export async function commitRename(
   await refreshTree();
 }
 
+/**
+ * Renames the note at `oldRelPath` by changing only its filename (the parent
+ * folder is preserved), appending ".md" if the caller omitted it. Used by the
+ * editable title in the editor header. No-op when the name is unchanged.
+ */
+export async function renameNote(
+  oldRelPath: string,
+  newTitle: string,
+): Promise<void> {
+  let name = newTitle.trim();
+  if (!name) return;
+  if (!name.toLowerCase().endsWith(".md")) name += ".md";
+  if (name.includes("/")) {
+    throw new Error("Name cannot contain '/'");
+  }
+  const idx = oldRelPath.lastIndexOf("/");
+  const currentName = idx === -1 ? oldRelPath : oldRelPath.slice(idx + 1);
+  if (name === currentName) return;
+
+  const parent = idx === -1 ? "" : oldRelPath.slice(0, idx);
+  const newRel = parent ? `${parent}/${name}` : name;
+  await invoke("rename_path", { oldRel: oldRelPath, newRel });
+
+  remapPaths(oldRelPath, newRel);
+  await refreshTree();
+}
+
 /** Moves `node` to the OS Trash (backend never hard-deletes). */
 export async function deleteToTrash(node: TreeNode): Promise<void> {
   await invoke("trash_path", { relPath: node.path });
