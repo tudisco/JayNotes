@@ -195,7 +195,7 @@
   }
 
   .hit:hover {
-    background-color: var(--code-bg);
+    background-color: var(--hover);
   }
 
   .hit-title {

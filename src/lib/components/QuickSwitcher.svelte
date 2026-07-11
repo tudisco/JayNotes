@@ -249,7 +249,7 @@
     background-color: var(--bg-panel);
     border: 1px solid var(--border);
     border-radius: 12px;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
+    box-shadow: var(--shadow-modal);
     overflow: hidden;
   }
 

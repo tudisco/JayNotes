@@ -31,7 +31,7 @@
   --crepe-color-error: #ef4444;
 
   /* Interaction states */
-  --crepe-color-hover: var(--code-bg);
+  --crepe-color-hover: var(--hover);
   --crepe-color-selected: color-mix(in srgb, var(--accent) 22%, transparent);
   --crepe-color-inline-area: var(--code-bg);
 
@@ -52,9 +52,16 @@
   padding: 8px 16px 40vh;
   font-family: var(--font-content);
   font-size: 16px;
-  line-height: 1.7;
+  line-height: 1.65;
   color: var(--text);
   caret-color: var(--accent);
+}
+
+/* The editing surface manages its own caret/selection affordance, so the
+   global focus-visible ring shouldn't box the whole content column. */
+.milkdown .ProseMirror:focus,
+.milkdown .ProseMirror:focus-visible {
+  outline: none;
 }
 
 .milkdown .ProseMirror :is(h1, h2, h3, h4, h5, h6) {
@@ -121,4 +128,17 @@
 
 .milkdown .milkdown-code-block .cm-content {
   caret-color: var(--accent);
+}
+
+/* Crepe ships CodeMirror's "one-dark" syntax theme, tuned for a dark surface.
+   In dark mode it sits perfectly on our dark --code-bg. In light mode we lift
+   the base (untokenized) text color so plain code and punctuation stay legible
+   on the light surface; the syntax token hues remain oneDark's. */
+:root:not([data-theme="dark"]) .milkdown .milkdown-code-block .cm-content,
+:root:not([data-theme="dark"]) .milkdown .milkdown-code-block .cm-line {
+  color: var(--text);
+}
+
+:root:not([data-theme="dark"]) .milkdown .milkdown-code-block .cm-gutters {
+  color: var(--text-muted);
 }

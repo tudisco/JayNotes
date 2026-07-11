@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { themeMode, cycleTheme, type ThemeMode } from "$lib/stores/theme";
   import {
     fileTree,
     newFolder,
@@ -13,6 +12,7 @@
   import FileTree from "./FileTree.svelte";
   import ContextMenu from "./ContextMenu.svelte";
   import SearchPanel from "./SearchPanel.svelte";
+  import SettingsMenu from "./SettingsMenu.svelte";
   import { sidebarMode, searchFocusNonce } from "$lib/stores/ui";
 
   function showFiles(): void {
@@ -23,18 +23,6 @@
     sidebarMode.set("search");
     searchFocusNonce.update((n) => n + 1);
   }
-
-  const themeLabels: Record<ThemeMode, string> = {
-    light: "Light",
-    dark: "Dark",
-    system: "System",
-  };
-
-  const themeIcons: Record<ThemeMode, string> = {
-    light: "☀",
-    dark: "☾",
-    system: "◐",
-  };
 
   async function handleNewNote(): Promise<void> {
     try {
@@ -197,14 +185,7 @@
   </nav>
 
   <div class="footer">
-    <button class="footer-item" type="button">
-      <span class="footer-icon">⚙</span>
-      <span>Settings</span>
-    </button>
-    <button class="footer-item" type="button" onclick={cycleTheme}>
-      <span class="footer-icon">{themeIcons[$themeMode]}</span>
-      <span>Theme: {themeLabels[$themeMode]}</span>
-    </button>
+    <SettingsMenu />
   </div>
 </aside>
 
@@ -307,7 +288,7 @@
   }
 
   .tool-btn:hover {
-    background-color: var(--code-bg);
+    background-color: var(--hover);
     color: var(--accent);
   }
 
@@ -343,48 +324,15 @@
   .error {
     margin: 8px;
     padding: 8px;
-    border: 1px solid #b91c1c;
+    border: 1px solid var(--danger);
     border-radius: 6px;
     font-size: 12px;
-    color: #b91c1c;
+    color: var(--danger);
     word-break: break-word;
   }
 
   .footer {
     border-top: 1px solid var(--border);
     padding: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .footer-item {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    width: 100%;
-    padding: 8px 8px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text);
-    font-size: 13px;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .footer-item:hover {
-    background-color: var(--code-bg);
-    color: var(--accent);
-  }
-
-  .footer-icon {
-    width: 16px;
-    text-align: center;
-    color: var(--text-muted);
-  }
-
-  .footer-item:hover .footer-icon {
-    color: var(--accent);
   }
 </style>

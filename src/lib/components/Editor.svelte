@@ -323,10 +323,10 @@
   .load-error {
     margin: 0 0 12px;
     padding: 12px;
-    border: 1px solid #b91c1c;
+    border: 1px solid var(--danger);
     border-radius: 8px;
     font-size: 13px;
-    color: #b91c1c;
+    color: var(--danger);
   }
 
   .save-status {

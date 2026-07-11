@@ -165,7 +165,7 @@
   }
 
   .row:hover {
-    background-color: var(--code-bg);
+    background-color: var(--hover);
   }
 
   .row.selected {

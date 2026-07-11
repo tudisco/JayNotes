@@ -163,14 +163,15 @@
     background: transparent;
     color: var(--text);
     font-family: var(--font-content);
-    font-size: 30px;
-    font-weight: 700;
-    line-height: 1.2;
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.015em;
     outline: none;
   }
 
   .note-title:focus {
-    background-color: var(--code-bg);
+    background-color: var(--hover);
   }
 
   .empty-state {

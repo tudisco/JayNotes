@@ -342,7 +342,7 @@
 
   .toggle:hover {
     color: var(--text);
-    background-color: var(--code-bg);
+    background-color: var(--hover);
   }
 
   .chevron {
@@ -366,7 +366,7 @@
 
   .add-props:hover {
     color: var(--text);
-    background-color: var(--code-bg);
+    background-color: var(--hover);
   }
 
   /* Expanded editor ------------------------------------------------------ */
@@ -480,7 +480,7 @@
 
   .row-x:hover {
     color: var(--text);
-    background-color: var(--code-bg);
+    background-color: var(--hover);
   }
 
   .add-row {
@@ -502,9 +502,9 @@
   .parse-error {
     margin: 6px 0;
     padding: 8px 10px;
-    border: 1px solid color-mix(in srgb, #b91c1c 50%, var(--border));
+    border: 1px solid color-mix(in srgb, var(--danger) 50%, var(--border));
     border-radius: 6px;
-    background-color: color-mix(in srgb, #b91c1c 8%, transparent);
+    background-color: color-mix(in srgb, var(--danger) 8%, transparent);
     color: var(--text-muted);
     font-size: 12px;
     line-height: 1.5;

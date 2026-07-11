@@ -152,7 +152,7 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     background-color: var(--bg-panel);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+    box-shadow: var(--shadow-menu);
   }
 
   .item {
@@ -209,16 +209,16 @@
   }
 
   .confirm-btn:hover {
-    background-color: var(--code-bg);
+    background-color: var(--hover);
   }
 
   .confirm-btn.danger {
-    border-color: #b91c1c;
-    color: #b91c1c;
+    border-color: var(--danger);
+    color: var(--danger);
   }
 
   .confirm-btn.danger:hover {
-    background-color: #b91c1c;
-    color: #ffffff;
+    background-color: var(--danger);
+    color: var(--danger-contrast);
   }
 </style>
