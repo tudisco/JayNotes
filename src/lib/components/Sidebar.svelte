@@ -1,5 +1,17 @@
 <script lang="ts">
   import { themeMode, cycleTheme, type ThemeMode } from "$lib/stores/theme";
+  import {
+    fileTree,
+    newFolder,
+    newItemTargetDir,
+    newNote,
+    openVault,
+    vaultError,
+    vaultLoading,
+    vaultPath,
+  } from "$lib/stores/vault";
+  import FileTree from "./FileTree.svelte";
+  import ContextMenu from "./ContextMenu.svelte";
 
   const themeLabels: Record<ThemeMode, string> = {
     light: "Light",
@@ -12,6 +24,22 @@
     dark: "☾",
     system: "◐",
   };
+
+  async function handleNewNote(): Promise<void> {
+    try {
+      await newNote(newItemTargetDir());
+    } catch (e) {
+      vaultError.set(String(e));
+    }
+  }
+
+  async function handleNewFolder(): Promise<void> {
+    try {
+      await newFolder(newItemTargetDir());
+    } catch (e) {
+      vaultError.set(String(e));
+    }
+  }
 </script>
 
 <aside class="sidebar">
@@ -20,8 +48,84 @@
   </div>
 
   <nav class="notes">
-    <div class="section-label">Notes</div>
-    <div class="empty-tree">Open a vault to get started</div>
+    <div class="section-header">
+      <span class="section-label">Notes</span>
+      {#if $vaultPath}
+        <div class="toolbar">
+          <button
+            type="button"
+            class="tool-btn"
+            title="New note"
+            aria-label="New note"
+            onclick={handleNewNote}
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path
+                d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5m-3.5-3.5L13 5m-3.5-3.5V4a1 1 0 0 0 1 1H13"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M8 7.5v4M6 9.5h4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="tool-btn"
+            title="New folder"
+            aria-label="New folder"
+            onclick={handleNewFolder}
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path
+                d="M1.5 3.5a1 1 0 0 1 1-1h3l1.5 2h6.5a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-9z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M8 7.5v3.5M6.25 9.25h3.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+        </div>
+      {/if}
+    </div>
+
+    {#if $vaultLoading}
+      <div class="empty-tree">Loading…</div>
+    {:else if !$vaultPath}
+      <div class="empty-tree">
+        <p>Open a vault to get started</p>
+        <button type="button" class="open-vault-btn" onclick={openVault}>
+          Open Vault
+        </button>
+      </div>
+    {:else if $fileTree}
+      {#if $fileTree.children.length === 0}
+        <div class="empty-tree">No notes yet</div>
+      {:else}
+        <FileTree nodes={$fileTree.children} />
+      {/if}
+    {/if}
+
+    {#if $vaultError}
+      <div class="error" role="alert">{$vaultError}</div>
+    {/if}
   </nav>
 
   <div class="footer">
@@ -35,6 +139,8 @@
     </button>
   </div>
 </aside>
+
+<ContextMenu />
 
 <style>
   .sidebar {
@@ -65,13 +171,41 @@
     padding: 12px 8px;
   }
 
+  .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 8px;
+  }
+
   .section-label {
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: var(--text-muted);
-    padding: 4px 8px;
+  }
+
+  .toolbar {
+    display: flex;
+    gap: 2px;
+  }
+
+  .tool-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 3px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .tool-btn:hover {
+    background-color: var(--code-bg);
+    color: var(--accent);
   }
 
   .empty-tree {
@@ -80,6 +214,37 @@
     font-size: 13px;
     color: var(--text-muted);
     font-style: italic;
+  }
+
+  .empty-tree p {
+    margin: 0 0 10px;
+  }
+
+  .open-vault-btn {
+    padding: 6px 12px;
+    border: none;
+    border-radius: 6px;
+    background-color: var(--accent);
+    color: var(--accent-contrast);
+    font-size: 13px;
+    font-weight: 500;
+    font-family: var(--font-ui);
+    font-style: normal;
+    cursor: pointer;
+  }
+
+  .open-vault-btn:hover {
+    background-color: var(--accent-hover);
+  }
+
+  .error {
+    margin: 8px;
+    padding: 8px;
+    border: 1px solid #b91c1c;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #b91c1c;
+    word-break: break-word;
   }
 
   .footer {
