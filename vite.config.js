@@ -8,6 +8,11 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [sveltekit()],
 
+  test: {
+    // Don't pick up duplicate suites from agent worktrees or deps.
+    exclude: ["**/node_modules/**", ".claude/**", "**/src-tauri/**"],
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
