@@ -2,10 +2,17 @@
 
 Backlog of possible features. Nothing here is committed work — it's a menu.
 
-## PDF export
-Export the current note as a nicely formatted PDF (same typography as the editor,
-code blocks with highlighting, images included).
-- Likely approach: render the note HTML in a hidden webview → native print-to-PDF
-  (`window.print()` / WKWebView PDF API via Tauri), or a Rust-side
-  markdown→HTML→PDF pipeline.
-- Nice extras: export folder to PDFs, page margins/header options in Settings.
+## CSV data in notes
+Support CSV files as first-class note content. Came up during the image
+migration (2026-07-11): a couple of notes embed CSVs Obsidian-style
+(`![[pfg_import_report.csv]]`, `![[invoicedetail (2).csv]]` in
+`Projects/PosReporting/Fintech Info/Fintech Notes.md`) and JayNotes currently
+ignores them — the files weren't migrated.
+- Minimal: allow CSVs in `attachments/`, render `![](attachments/x.csv)` as a
+  read-only sortable table in the editor (parse client-side, cap rows shown).
+- Bigger: a CSV/table view mode with column sorting + filtering; AI tools to
+  read CSV data so the assistant can answer questions about it.
+- Migration follow-up: copy those two CSVs over once supported.
+
+## Shipped from this list
+- PDF export — shipped as M10 (pure-Rust Typst pipeline, cross-platform).
