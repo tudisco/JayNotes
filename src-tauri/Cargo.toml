@@ -17,6 +17,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Personal builds ship every provider; a public build compiles unwanted
+# providers OUT with `--no-default-features` plus an explicit list. The frontend
+# hardcodes nothing (see `list_providers`), so an omitted provider leaves zero
+# UI trace and a saved vault of that kind shows "unsupported in this build".
+default = ["provider-encrypted-db"]
+# Internal umbrella pulled in by every encrypted provider: the shared KDF,
+# unlock-session, and OS-keyring plumbing (compiled only when something needs it).
+encryption = ["dep:keyring", "dep:scrypt", "dep:zeroize"]
+provider-encrypted-db = ["encryption"]
+# Declared placeholders for later milestones (M15/M16); no module yet.
+provider-encrypted-files = ["encryption"]
+provider-tinylord = []
+
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
@@ -25,7 +39,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
 trash = "5"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+# SQLCipher build of SQLite (PRAGMA key). This changes the SQLite used by the
+# EXISTING plain index too; SQLCipher opens unkeyed DBs as ordinary SQLite, so
+# plain-vault indexes are unaffected. Vendored OpenSSL avoids a system dep.
+rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher-vendored-openssl"] }
+# Shared encryption plumbing (gated behind any encrypted provider).
+keyring = { version = "3", optional = true }
+scrypt = { version = "0.11", optional = true }
+zeroize = { version = "1", optional = true }
 notify-debouncer-full = "0.7.0"
 serde_yaml = "0.9.34"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "http2"] }

@@ -45,6 +45,11 @@ const SCHEMA_VERSION: i64 = 1;
 pub struct AppState {
     /// The open index for the current vault, or `None` when no vault is set.
     /// An `Arc` so the file watcher thread can hold its own handle.
+    ///
+    /// For a plain vault this is the separate on-disk FTS index. For a
+    /// self-indexing vault (encrypted-db, whose container *is* the index) this
+    /// stays `None` and the search commands dispatch through [`Self::active`]
+    /// instead — see `VaultHandle::owns_index`.
     pub index: Arc<Mutex<Option<Index>>>,
     /// Paths (vault-relative) the app itself wrote recently, with a timestamp,
     /// so the watcher can ignore its own writes. Shared with the watcher.
@@ -52,6 +57,10 @@ pub struct AppState {
     /// The active file watcher; dropping it stops watching. Replaced on each
     /// vault change.
     pub watcher: Mutex<Option<crate::watcher::WatcherHandle>>,
+    /// The active vault's opened storage handle, through which every `vault.rs`
+    /// command dispatches. `None` when no vault is open (e.g. an encrypted vault
+    /// that hasn't been unlocked yet).
+    pub active: Mutex<Option<Box<dyn crate::providers::VaultHandle>>>,
 }
 
 impl Default for AppState {
@@ -60,6 +69,7 @@ impl Default for AppState {
             index: Arc::new(Mutex::new(None)),
             recent_writes: Arc::new(Mutex::new(HashMap::new())),
             watcher: Mutex::new(None),
+            active: Mutex::new(None),
         }
     }
 }
@@ -360,7 +370,7 @@ pub fn extract(raw: &str) -> Extracted {
 /// Splits a raw search query into `(text_terms, tag_filters)`. Whitespace
 /// tokens of the form `tag:foo` become tag filters (leading `#` stripped);
 /// everything else is a free-text term. Both are order-preserving.
-fn parse_query(query: &str) -> (Vec<String>, Vec<String>) {
+pub(crate) fn parse_query(query: &str) -> (Vec<String>, Vec<String>) {
     let mut terms = Vec::new();
     let mut tags = Vec::new();
     for tok in query.split_whitespace() {
@@ -383,7 +393,7 @@ fn parse_query(query: &str) -> (Vec<String>, Vec<String>) {
 /// dropped so we never emit an empty-phrase (`""`) that FTS rejects. A trailing
 /// `*` on the last surviving term gives prefix-as-you-type matching. Returns
 /// `None` when nothing searchable remains.
-fn build_match(terms: &[String]) -> Option<String> {
+pub(crate) fn build_match(terms: &[String]) -> Option<String> {
     let kept: Vec<&String> = terms
         .iter()
         .filter(|t| t.chars().any(char::is_alphanumeric))
@@ -415,7 +425,7 @@ pub(crate) fn strip_md_suffix(s: &str) -> &str {
 }
 
 /// Title from a vault-relative path: the file stem (name without `.md`).
-fn title_of(rel: &str) -> String {
+pub(crate) fn title_of(rel: &str) -> String {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     name.strip_suffix(".md")
         .or_else(|| name.strip_suffix(".MD"))
@@ -1224,6 +1234,10 @@ pub fn init_for_vault(
     let index = Index::open(&db_path, vault_root)?;
     *state.index.lock().unwrap() = Some(index);
 
+    // Install the plain storage handle every command dispatches through.
+    *state.active.lock().unwrap() =
+        Some(Box::new(crate::providers::plain::PlainHandle::new(vault_root)));
+
     // Replace the watcher (dropping the old one stops it).
     let handle = crate::watcher::start_watcher(
         app.clone(),
@@ -1251,10 +1265,27 @@ pub fn init_for_vault(
 // Commands
 // ---------------------------------------------------------------------------
 
+/// True when the active vault handle owns its own index (encrypted-db), so the
+/// search commands below must dispatch through the handle rather than
+/// `state.index` (which is `None` for such vaults).
+fn active_owns_index(state: &AppState) -> bool {
+    state
+        .active
+        .lock()
+        .unwrap()
+        .as_deref()
+        .map(|h| h.owns_index())
+        .unwrap_or(false)
+}
+
 /// Forces a full rescan of the current vault. Returns the number of files
 /// (re)indexed.
 #[tauri::command]
 pub async fn reindex_vault(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    if active_owns_index(&state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().reindex();
+    }
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("No vault is indexed")?;
     index.full_scan()
@@ -1263,6 +1294,10 @@ pub async fn reindex_vault(state: tauri::State<'_, AppState>) -> Result<usize, S
 /// Returns the current index status (note count + last full-scan duration ms).
 #[tauri::command]
 pub async fn index_status(state: tauri::State<'_, AppState>) -> Result<IndexStatus, String> {
+    if active_owns_index(&state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().status();
+    }
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("No vault is indexed")?;
     index.status()
@@ -1275,6 +1310,10 @@ pub async fn search_notes(
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<SearchHit>, String> {
+    if active_owns_index(&state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().search(&query, limit.unwrap_or(50));
+    }
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("No vault is indexed")?;
     index.search(&query, limit.unwrap_or(50))
@@ -1283,6 +1322,10 @@ pub async fn search_notes(
 /// Lists all indexed notes, newest first, for the quick switcher.
 #[tauri::command]
 pub async fn list_notes(state: tauri::State<'_, AppState>) -> Result<Vec<NoteRef>, String> {
+    if active_owns_index(&state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().list_notes();
+    }
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("No vault is indexed")?;
     index.list_notes()
@@ -1291,6 +1334,10 @@ pub async fn list_notes(state: tauri::State<'_, AppState>) -> Result<Vec<NoteRef
 /// Lists every distinct tag with its note count, sorted alphabetically.
 #[tauri::command]
 pub async fn list_tags(state: tauri::State<'_, AppState>) -> Result<Vec<TagCount>, String> {
+    if active_owns_index(&state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().list_tags();
+    }
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("No vault is indexed")?;
     index.list_tags()
@@ -1303,6 +1350,10 @@ pub async fn notes_by_tag(
     tag: String,
     limit: Option<u32>,
 ) -> Result<Vec<SearchHit>, String> {
+    if active_owns_index(&state) {
+        let g = state.active.lock().unwrap();
+        return g.as_deref().unwrap().notes_by_tag(&tag, limit.unwrap_or(500));
+    }
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("No vault is indexed")?;
     index.notes_by_tag(&tag, limit.unwrap_or(500))

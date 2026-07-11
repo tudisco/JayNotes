@@ -20,21 +20,42 @@ const SETTINGS_FILE: &str = "settings.json";
 // Types
 // ---------------------------------------------------------------------------
 
-/// The kind of a vault. `Plain` is the only kind in M13; M14 adds `Encrypted`.
+/// The kind of a vault. `Plain` is the built-in default; `EncryptedDb` (M14) is
+/// the first non-plain kind, gated behind the `provider-encrypted-db` feature at
+/// the provider layer (the enum variant is always present so a settings file
+/// written by a full build still deserializes in a plain-only build — such a
+/// vault simply shows "unsupported"; see `providers::kind_supported`).
 ///
-/// Kept as an enum (rather than a bare string) specifically so downstream
-/// `match` statements are exhaustive and the compiler flags every site that
-/// must learn about a new kind when one is added. Serializes lowercase
-/// (`"plain"`) to match the frontend contract.
+/// Kept as an enum (rather than a bare string) so downstream `match` statements
+/// are exhaustive and the compiler flags every site that must learn about a new
+/// kind. Serializes kebab-case (`"plain"`, `"encrypted-db"`) to match the
+/// frontend/provider `kind()` contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum VaultKind {
     #[default]
     Plain,
+    EncryptedDb,
 }
 
-/// One configured vault: a stable id, a display name, an absolute folder path,
-/// and its kind. Persisted verbatim in `settings.json` under `vaults`.
+impl VaultKind {
+    /// The stable string id used by the provider registry and the frontend.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VaultKind::Plain => "plain",
+            VaultKind::EncryptedDb => "encrypted-db",
+        }
+    }
+}
+
+/// One configured vault: a stable id, a display name, an absolute path (a folder
+/// for plain vaults, or the `<name>.jaynotes` container file for encrypted-db),
+/// its kind, and provider-specific config.
+///
+/// `config` holds non-secret provider data persisted in plaintext — e.g. an
+/// encrypted-db vault's KDF `salt` (a salt is not secret) — so the shared struct
+/// stays kind-agnostic while providers stash what they need. Persisted verbatim
+/// in `settings.json` under `vaults`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Vault {
@@ -43,6 +64,8 @@ pub struct Vault {
     pub path: String,
     #[serde(default)]
     pub kind: VaultKind,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub config: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Persisted app settings. Unknown keys are preserved via `extra` so future
@@ -106,6 +129,7 @@ fn migrate(settings: &mut Settings) {
                     name: basename_of(&path),
                     path,
                     kind: VaultKind::Plain,
+                    config: Default::default(),
                 });
                 settings.active_vault_id = Some(id);
             }
@@ -183,20 +207,6 @@ pub(crate) fn vault_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("Could not resolve vault directory: {e}"))
 }
 
-/// Returns the canonicalized active vault root if one is configured and still
-/// exists on disk, else `None`. Used by startup index initialization, where a
-/// missing/offline vault should simply mean "no index" rather than an error.
-pub fn saved_vault_root(app: &tauri::AppHandle) -> Option<String> {
-    let settings = load_settings(app).ok()?;
-    let root = PathBuf::from(&active_vault(&settings)?.path);
-    if !root.is_dir() {
-        return None;
-    }
-    root.canonicalize()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-}
-
 // ---------------------------------------------------------------------------
 // Path safety
 // ---------------------------------------------------------------------------
@@ -253,7 +263,7 @@ fn is_markdown(path: &Path) -> bool {
 /// Walks `root` and builds a tree of folders and `.md` files. Hidden
 /// (dot-prefixed) files and directories are skipped entirely. Children are
 /// sorted folders-first, then case-insensitive alphabetical.
-fn scan_tree(root: &Path) -> Result<TreeNode, String> {
+pub(crate) fn scan_tree(root: &Path) -> Result<TreeNode, String> {
     let mut root_node = TreeNode {
         name: root
             .file_name()
@@ -407,6 +417,7 @@ pub async fn set_vault(
                 name,
                 path: canonical_str,
                 kind: VaultKind::Plain,
+                config: Default::default(),
             });
             id
         }
@@ -422,34 +433,45 @@ pub async fn set_vault(
     Ok(())
 }
 
+/// Runs `f` against the active vault's opened handle, erroring if no vault is
+/// currently open (e.g. an encrypted vault that hasn't been unlocked). This is
+/// the single dispatch seam: every storage command below is a one-liner over
+/// the active [`crate::providers::VaultHandle`], plain or encrypted alike.
+pub(crate) fn with_active<T>(
+    state: &AppState,
+    f: impl FnOnce(&dyn crate::providers::VaultHandle) -> Result<T, String>,
+) -> Result<T, String> {
+    let guard = state.active.lock().unwrap();
+    let handle = guard
+        .as_deref()
+        .ok_or("No vault is open — it may need to be unlocked")?;
+    f(handle)
+}
+
 /// Scans the vault and returns the full folder/.md-file tree.
 #[tauri::command]
-pub async fn scan_vault(app: tauri::AppHandle) -> Result<TreeNode, String> {
-    let root = vault_root(&app)?;
-    scan_tree(&root)
+pub async fn scan_vault(state: tauri::State<'_, AppState>) -> Result<TreeNode, String> {
+    with_active(state.inner(), |h| h.scan_tree())
 }
 
 /// Reads a note's contents.
 #[tauri::command]
-pub async fn read_note(app: tauri::AppHandle, rel_path: String) -> Result<String, String> {
-    let root = vault_root(&app)?;
-    let path = safe_join(&root, &rel_path)?;
-    if !path.is_file() {
-        return Err(format!("Note does not exist: {rel_path}"));
-    }
-    fs::read_to_string(&path).map_err(|e| format!("Could not read note '{rel_path}': {e}"))
+pub async fn read_note(
+    state: tauri::State<'_, AppState>,
+    rel_path: String,
+) -> Result<String, String> {
+    with_active(state.inner(), |h| h.read_note(&rel_path))
 }
 
 /// Writes a note's contents, creating parent directories if needed.
 #[tauri::command]
 pub async fn write_note(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     rel_path: String,
     content: String,
 ) -> Result<(), String> {
-    let root = vault_root(&app)?;
-    write_note_at(&root, &state, &rel_path, &content)
+    let st = state.inner();
+    with_active(st, |h| h.write_note(st, &rel_path, &content))
 }
 
 /// Creates an empty note. If `rel_path` is an existing directory (or empty,
@@ -459,14 +481,53 @@ pub async fn write_note(
 /// relative path.
 #[tauri::command]
 pub async fn create_note(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     rel_path: String,
 ) -> Result<String, String> {
-    let root = vault_root(&app)?;
-    let target = safe_join(&root, &rel_path)?;
+    let st = state.inner();
+    with_active(st, |h| h.create_note(st, &rel_path))
+}
 
-    let file_path = if rel_path.is_empty() || target.is_dir() {
+/// Creates a folder (and any missing parents). Errors if it already exists.
+#[tauri::command]
+pub async fn create_folder(
+    state: tauri::State<'_, AppState>,
+    rel_path: String,
+) -> Result<(), String> {
+    with_active(state.inner(), |h| h.create_folder(&rel_path))
+}
+
+/// Renames/moves a file or folder within the vault. Errors if the target
+/// already exists.
+#[tauri::command]
+pub async fn rename_path(
+    state: tauri::State<'_, AppState>,
+    old_rel: String,
+    new_rel: String,
+) -> Result<(), String> {
+    let st = state.inner();
+    with_active(st, |h| h.rename(st, &old_rel, &new_rel))
+}
+
+/// Moves a file or folder to the OS Trash. Never hard-deletes.
+#[tauri::command]
+pub async fn trash_path(
+    state: tauri::State<'_, AppState>,
+    rel_path: String,
+) -> Result<(), String> {
+    let st = state.inner();
+    with_active(st, |h| h.trash(st, &rel_path))
+}
+
+/// Core for creating a note at `rel` (untitled semantics), used by the plain
+/// provider handle. See the `create_note` command for the semantics.
+pub(crate) fn create_note_core(
+    root: &Path,
+    state: &AppState,
+    rel: &str,
+) -> Result<String, String> {
+    let target = safe_join(root, rel)?;
+    let file_path = if rel.is_empty() || target.is_dir() {
         unique_untitled(&target)?
     } else {
         let mut path = target;
@@ -474,7 +535,7 @@ pub async fn create_note(
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .ok_or_else(|| format!("Invalid note path: {rel_path}"))?;
+                .ok_or_else(|| format!("Invalid note path: {rel}"))?;
             path.set_file_name(format!("{name}.md"));
         }
         if path.exists() {
@@ -485,41 +546,37 @@ pub async fn create_note(
         }
         path
     };
-
-    let created_rel = to_rel_string(&root, &file_path)?;
-    write_note_at(&root, &state, &created_rel, "")?;
+    let created_rel = to_rel_string(root, &file_path)?;
+    write_note_at(root, state, &created_rel, "")?;
     Ok(created_rel)
 }
 
-/// Creates a folder (and any missing parents). Errors if it already exists.
-#[tauri::command]
-pub async fn create_folder(app: tauri::AppHandle, rel_path: String) -> Result<(), String> {
-    let root = vault_root(&app)?;
-    create_folder_at(&root, &rel_path)
+/// Core for reading a note file's text (plain provider handle).
+pub(crate) fn read_note_core(root: &Path, rel: &str) -> Result<String, String> {
+    let path = safe_join(root, rel)?;
+    if !path.is_file() {
+        return Err(format!("Note does not exist: {rel}"));
+    }
+    fs::read_to_string(&path).map_err(|e| format!("Could not read note '{rel}': {e}"))
 }
 
-/// Renames/moves a file or folder within the vault. Errors if the target
-/// already exists.
-#[tauri::command]
-pub async fn rename_path(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    old_rel: String,
-    new_rel: String,
-) -> Result<(), String> {
-    let root = vault_root(&app)?;
-    rename_at(&root, &state, &old_rel, &new_rel)
+/// Core for reading raw attachment bytes (plain provider handle).
+pub(crate) fn read_attachment_core(root: &Path, rel: &str) -> Result<Vec<u8>, String> {
+    let path = safe_join(root, rel)?;
+    if !path.is_file() {
+        return Err(format!("Attachment does not exist: {rel}"));
+    }
+    fs::read(&path).map_err(|e| format!("Could not read attachment '{rel}': {e}"))
 }
 
-/// Moves a file or folder to the OS Trash. Never hard-deletes.
-#[tauri::command]
-pub async fn trash_path(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    rel_path: String,
-) -> Result<(), String> {
-    let root = vault_root(&app)?;
-    trash_at(&root, &state, &rel_path)
+/// Core for revealing a file/folder in the OS file manager (plain handle only).
+pub(crate) fn reveal_core(root: &Path, rel: &str) -> Result<(), String> {
+    let path = safe_join(root, rel)?;
+    if !path.exists() {
+        return Err(format!("'{rel}' does not exist"));
+    }
+    tauri_plugin_opener::reveal_item_in_dir(&path)
+        .map_err(|e| format!("Could not reveal '{rel}': {e}"))
 }
 
 /// Resolves a `[[wikilink]]` target `name` to an existing note's relative path
@@ -529,39 +586,49 @@ pub async fn resolve_note(
     state: tauri::State<'_, AppState>,
     name: String,
 ) -> Result<Option<String>, String> {
-    let guard = state.index.lock().unwrap();
-    let index = guard.as_ref().ok_or("No vault is indexed")?;
-    index.resolve(&name)
+    resolve_via_active(state.inner(), &name)
 }
 
-/// Resolves a `[[wikilink]]` target to an existing note, or creates an empty
-/// `<name>.md` in the vault root when nothing matches. The name is sanitized
-/// into a safe single filename. Returns the resolved/created relative path.
-#[tauri::command]
-pub async fn resolve_or_create_note(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    name: String,
-) -> Result<String, String> {
-    // Try the index first; drop the lock before any filesystem work.
+/// Resolves a wikilink target through whichever index the active vault uses: a
+/// self-indexing handle (encrypted-db) resolves via its container; a plain
+/// vault via the separate FTS `state.index`.
+pub(crate) fn resolve_via_active(state: &AppState, name: &str) -> Result<Option<String>, String> {
     {
-        let guard = state.index.lock().unwrap();
-        if let Some(idx) = guard.as_ref() {
-            if let Some(path) = idx.resolve(&name)? {
-                return Ok(path);
+        let active = state.active.lock().unwrap();
+        if let Some(h) = active.as_deref() {
+            if h.owns_index() {
+                return h.resolve(name);
             }
         }
     }
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("No vault is indexed")?;
+    index.resolve(name)
+}
 
-    let root = vault_root(&app)?;
+/// Resolves a `[[wikilink]]` target to an existing note, or creates an empty
+/// `<name>.md` when nothing matches. The name is sanitized into a safe single
+/// filename. Returns the resolved/created relative path. Dispatches through the
+/// active handle so it works for both plain and encrypted vaults.
+#[tauri::command]
+pub async fn resolve_or_create_note(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<String, String> {
+    if let Some(path) = resolve_via_active(state.inner(), &name)? {
+        return Ok(path);
+    }
     let base = sanitize_note_name(&name);
     let rel = format!("{base}.md");
-    let path = safe_join(&root, &rel)?;
-    // If a same-named file exists but wasn't indexed yet, just open it.
-    if !path.exists() {
-        write_note_at(&root, &state, &rel, "")?;
-    }
-    Ok(rel)
+    let st = state.inner();
+    with_active(st, |h| {
+        // If a same-named note already exists but wasn't indexed yet, open it;
+        // otherwise create it empty.
+        if h.read_note(&rel).is_err() {
+            h.write_note(st, &rel, "")?;
+        }
+        Ok(rel.clone())
+    })
 }
 
 /// Turns an arbitrary wikilink target into a safe single filename: any path
@@ -597,7 +664,7 @@ const ALLOWED_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg"
 /// characters illegal in a filename become `-`, and the extension is validated
 /// against [`ALLOWED_IMAGE_EXTS`]. The base falls back to `pasted-image` when
 /// nothing usable remains. Returns an error for missing or disallowed types.
-fn sanitize_attachment_name(raw: &str) -> Result<(String, String), String> {
+pub(crate) fn sanitize_attachment_name(raw: &str) -> Result<(String, String), String> {
     // Keep only the final path segment so `../../evil.png` can't escape.
     let last = raw.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(raw);
     // Strip leading dots so `.png` / `.hidden` can't produce a dotfile.
@@ -662,37 +729,106 @@ fn unique_attachment_path(dir: &Path, base: &str, ext: &str) -> Result<PathBuf, 
 /// sanitized and uniquified; only common image types are accepted.
 #[tauri::command]
 pub async fn save_attachment(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_name: String,
     data: Vec<u8>,
 ) -> Result<String, String> {
-    let root = vault_root(&app)?;
-    let (base, ext) = sanitize_attachment_name(&file_name)?;
+    let st = state.inner();
+    with_active(st, |h| h.save_attachment(st, &file_name, &data))
+}
+
+/// Core for saving image bytes under `attachments/` (plain provider handle).
+pub(crate) fn save_attachment_core(
+    root: &Path,
+    state: &AppState,
+    file_name: &str,
+    data: &[u8],
+) -> Result<String, String> {
+    let (base, ext) = sanitize_attachment_name(file_name)?;
 
     let dir = root.join("attachments");
     fs::create_dir_all(&dir)
         .map_err(|e| format!("Could not create attachments folder: {e}"))?;
 
     let path = unique_attachment_path(&dir, &base, &ext)?;
-    let rel = to_rel_string(&root, &path)?;
+    let rel = to_rel_string(root, &path)?;
     // Register the write so the watcher ignores it. Harmless: the watcher skips
     // non-.md files anyway, but this keeps the suppression path uniform.
     register_write(&state.recent_writes, &rel);
-    atomic_write(&path, &data)?;
+    atomic_write(&path, data)?;
     Ok(rel)
 }
 
-/// Reveals a file or folder in the OS file manager (Finder on macOS).
+/// Returns an attachment's bytes as a `data:` URI. Used by the editor image
+/// resolver for vaults where `convertFileSrc` can't reach the bytes (encrypted
+/// containers). Capped so a pathological blob can't wedge the webview.
 #[tauri::command]
-pub async fn reveal_in_finder(app: tauri::AppHandle, rel_path: String) -> Result<(), String> {
-    let root = vault_root(&app)?;
-    let path = safe_join(&root, &rel_path)?;
-    if !path.exists() {
-        return Err(format!("'{rel_path}' does not exist"));
+pub async fn read_attachment_data_url(
+    state: tauri::State<'_, AppState>,
+    rel_path: String,
+) -> Result<String, String> {
+    const MAX_BYTES: usize = 20 * 1024 * 1024; // ~20MB display cap
+    let bytes = with_active(state.inner(), |h| h.read_attachment(&rel_path))?;
+    if bytes.len() > MAX_BYTES {
+        return Err(format!(
+            "Attachment '{rel_path}' is too large to display ({} MB)",
+            bytes.len() / (1024 * 1024)
+        ));
     }
-    tauri_plugin_opener::reveal_item_in_dir(&path)
-        .map_err(|e| format!("Could not reveal '{rel_path}': {e}"))
+    let mime = mime_for(&rel_path);
+    Ok(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+}
+
+/// Guesses an image MIME type from a path's extension (attachments are always
+/// one of [`ALLOWED_IMAGE_EXTS`]).
+fn mime_for(rel: &str) -> &'static str {
+    let ext = rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Minimal standard-alphabet base64 encoder (no external dep in the main crate).
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Reveals a file or folder in the OS file manager (Finder on macOS). Errors on
+/// vaults whose handle doesn't support it (encrypted-db) — the frontend hides
+/// the action via `capabilities.reveal_in_finder`, but the guard is enforced
+/// here too.
+#[tauri::command]
+pub async fn reveal_in_finder(
+    state: tauri::State<'_, AppState>,
+    rel_path: String,
+) -> Result<(), String> {
+    with_active(state.inner(), |h| h.reveal_in_finder(&rel_path))
 }
 
 // ---------------------------------------------------------------------------

@@ -33,13 +33,17 @@ use crate::vault::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VaultStatus {
-    /// The folder exists and is reachable.
+    /// The folder/container exists and is reachable.
     Ok,
     /// The folder is gone but its volume is unmounted (e.g. an external drive
     /// is unplugged). The vault is intact — it just isn't reachable right now.
     Offline,
     /// The folder is gone on a mounted volume — it was moved or deleted.
     Missing,
+    /// The vault's kind has no provider compiled into this build (a public build
+    /// that omitted the feature). Kept forever, never pruned; the switcher row is
+    /// disabled with "unsupported in this build".
+    Unsupported,
 }
 
 /// Extracts `/Volumes/<name>` from a macOS external-volume path.
@@ -58,29 +62,35 @@ fn volume_root(path: &str) -> Option<String> {
 
 /// Classifies a vault path as ok / offline / missing.
 ///
-/// `dir_exists` decides whether a given path is an existing directory; the real
-/// caller passes `|p| p.is_dir()`, tests inject a fake so `/Volumes/...` paths
-/// can be simulated deterministically.
+/// `exists` decides whether a given path is present; the real caller passes
+/// `|p| p.exists()` (a plain vault's folder or an encrypted-db vault's container
+/// file), tests inject a fake so `/Volumes/...` paths can be simulated
+/// deterministically.
 ///
-/// - folder exists                          → [`VaultStatus::Ok`]
-/// - folder missing, volume root missing    → [`VaultStatus::Offline`]
-/// - folder missing, volume root present    → [`VaultStatus::Missing`]
-/// - folder missing, not under `/Volumes/`  → [`VaultStatus::Missing`]
-fn classify_status(path: &str, dir_exists: &dyn Fn(&Path) -> bool) -> VaultStatus {
-    if dir_exists(Path::new(path)) {
+/// - path exists                          → [`VaultStatus::Ok`]
+/// - path missing, volume root missing    → [`VaultStatus::Offline`]
+/// - path missing, volume root present    → [`VaultStatus::Missing`]
+/// - path missing, not under `/Volumes/`  → [`VaultStatus::Missing`]
+fn classify_status(path: &str, exists: &dyn Fn(&Path) -> bool) -> VaultStatus {
+    if exists(Path::new(path)) {
         return VaultStatus::Ok;
     }
     if let Some(vol) = volume_root(path) {
-        if !dir_exists(Path::new(&vol)) {
+        if !exists(Path::new(&vol)) {
             return VaultStatus::Offline;
         }
     }
     VaultStatus::Missing
 }
 
-/// Real-filesystem status of a vault path.
-fn status_of(path: &str) -> VaultStatus {
-    classify_status(path, &|p| p.is_dir())
+/// Real-filesystem reachability status of a vault, kind-aware: a vault whose
+/// kind has no compiled provider is [`VaultStatus::Unsupported`] regardless of
+/// disk state; otherwise its path presence is classified.
+fn status_of_vault(vault: &Vault) -> VaultStatus {
+    if !crate::providers::kind_supported(vault.kind.as_str()) {
+        return VaultStatus::Unsupported;
+    }
+    classify_status(&vault.path, &|p| p.exists())
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +174,9 @@ pub async fn list_vaults(
     let mut removed: Vec<String> = Vec::new();
     let prev_active = settings.active_vault_id.clone();
     settings.vaults.retain(|v| {
-        if status_of(&v.path) == VaultStatus::Missing {
+        // Only prune vaults whose folder vanished on a *mounted* volume. Offline
+        // (drive unplugged) and Unsupported (kind not in this build) are kept.
+        if status_of_vault(v) == VaultStatus::Missing {
             removed.push(v.name.clone());
             false
         } else {
@@ -199,7 +211,7 @@ pub async fn list_vaults(
             name: v.name.clone(),
             path: v.path.clone(),
             kind: v.kind,
-            status: status_of(&v.path),
+            status: status_of_vault(v),
         })
         .collect();
 
@@ -240,6 +252,7 @@ pub async fn add_vault(app: tauri::AppHandle, path: String) -> Result<Vault, Str
         name: dedup_name(&basename_of(&canonical), &settings.vaults),
         path: canonical,
         kind: VaultKind::Plain,
+        config: Default::default(),
     };
     settings.vaults.push(vault.clone());
     save_settings(&app, &settings)?;
@@ -343,24 +356,54 @@ pub async fn switch_vault(
         .ok_or("No such vault")?
         .clone();
 
-    let root = Path::new(&vault.path);
-    if !root.is_dir() {
+    if !crate::providers::kind_supported(vault.kind.as_str()) {
+        return Err(format!(
+            "Vault '{}' is unsupported in this build",
+            vault.name
+        ));
+    }
+
+    if vault.kind == VaultKind::Plain {
+        let root = Path::new(&vault.path);
+        if !root.is_dir() {
+            return Err(format!(
+                "Vault '{}' is not reachable — is the drive connected?",
+                vault.name
+            ));
+        }
+        let canonical = root
+            .canonicalize()
+            .map_err(|e| format!("Could not resolve vault directory: {e}"))?;
+
+        settings.active_vault_id = Some(id);
+        save_settings(&app, &settings)?;
+
+        if let Err(e) = index::init_for_vault(&app, &state, &canonical) {
+            eprintln!("Index init failed for {}: {e}", canonical.display());
+        }
+        return Ok(canonical.to_string_lossy().into_owned());
+    }
+
+    // Non-plain (encrypted-db, …): the container file must be present.
+    let file = Path::new(&vault.path);
+    if !file.exists() {
         return Err(format!(
             "Vault '{}' is not reachable — is the drive connected?",
             vault.name
         ));
     }
-    let canonical = root
-        .canonicalize()
-        .map_err(|e| format!("Could not resolve vault directory: {e}"))?;
-
     settings.active_vault_id = Some(id);
     save_settings(&app, &settings)?;
 
-    if let Err(e) = index::init_for_vault(&app, &state, &canonical) {
-        eprintln!("Index init failed for {}: {e}", canonical.display());
+    // Try to open it silently (unlocked session / remembered key). If that
+    // fails it stays locked, and the frontend shows the unlock prompt — clear
+    // any previous backend so a stale vault isn't left active.
+    if !crate::providers::try_auto_open(&app, &state, &vault) {
+        *state.index.lock().unwrap() = None;
+        *state.watcher.lock().unwrap() = None;
+        *state.active.lock().unwrap() = None;
     }
-    Ok(canonical.to_string_lossy().into_owned())
+    Ok(vault.path.clone())
 }
 
 /// Re-inits the index/watcher for the currently active vault in `settings`, or
@@ -368,7 +411,7 @@ pub async fn switch_vault(
 /// non-fatal (the vault is still usable without search).
 fn reinit_active(app: &tauri::AppHandle, state: &AppState, settings: &crate::vault::Settings) {
     match active_vault(settings) {
-        Some(v) => {
+        Some(v) if v.kind == VaultKind::Plain => {
             let root = Path::new(&v.path);
             if let Ok(canonical) = root.canonicalize() {
                 if let Err(e) = index::init_for_vault(app, state, &canonical) {
@@ -376,10 +419,19 @@ fn reinit_active(app: &tauri::AppHandle, state: &AppState, settings: &crate::vau
                 }
             }
         }
+        Some(v) => {
+            // Non-plain: open silently if possible, else leave locked.
+            if !crate::providers::try_auto_open(app, state, v) {
+                *state.index.lock().unwrap() = None;
+                *state.watcher.lock().unwrap() = None;
+                *state.active.lock().unwrap() = None;
+            }
+        }
         None => {
-            // No active vault: drop the index and stop the watcher.
+            // No active vault: drop the index, watcher, and backend.
             *state.index.lock().unwrap() = None;
             *state.watcher.lock().unwrap() = None;
+            *state.active.lock().unwrap() = None;
         }
     }
 }
@@ -454,6 +506,7 @@ mod tests {
             name: name.to_string(),
             path: format!("/x/{name}"),
             kind: VaultKind::Plain,
+            config: Default::default(),
         };
         let existing = vec![mk("Notes"), mk("Work 2")];
         // Fresh name is unchanged.
@@ -489,6 +542,7 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             kind: VaultKind::Plain,
+            config: Default::default(),
         };
         let vaults = vec![
             mk("Ok", "/ok"),
@@ -504,5 +558,37 @@ mod tests {
         let names: Vec<&str> = kept.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["Ok", "Offline"]);
         assert_eq!(removed, vec!["Missing"]);
+    }
+
+    /// An `encrypted-db` vault reports [`VaultStatus::Unsupported`] when the
+    /// provider feature is compiled out (public plain-only build) — and is
+    /// therefore never pruned regardless of disk state.
+    #[cfg(not(feature = "provider-encrypted-db"))]
+    #[test]
+    fn encrypted_vault_unsupported_without_feature() {
+        let v = Vault {
+            id: "e".into(),
+            name: "Enc".into(),
+            path: "/nope/secret.jaynotes".into(),
+            kind: VaultKind::EncryptedDb,
+            config: Default::default(),
+        };
+        assert_eq!(status_of_vault(&v), VaultStatus::Unsupported);
+    }
+
+    /// With the feature on, an `encrypted-db` vault is a supported kind and is
+    /// classified by its container file's presence like any other vault.
+    #[cfg(feature = "provider-encrypted-db")]
+    #[test]
+    fn encrypted_vault_supported_with_feature() {
+        let present = Vault {
+            id: "e".into(),
+            name: "Enc".into(),
+            path: "/nope/secret.jaynotes".into(),
+            kind: VaultKind::EncryptedDb,
+            config: Default::default(),
+        };
+        // Not on a /Volumes/ path and missing → Missing (a supported kind).
+        assert_eq!(status_of_vault(&present), VaultStatus::Missing);
     }
 }

@@ -1,11 +1,10 @@
 mod ai;
 mod index;
 mod pdf;
+mod providers;
 mod vault;
 mod vaults;
 mod watcher;
-
-use std::path::Path;
 
 use ai::AppAiState;
 use index::AppState;
@@ -13,21 +12,24 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
-        .manage(AppAiState::default())
+        .manage(AppAiState::default());
+
+    // The unlock-session state exists only when an encrypted provider is built.
+    #[cfg(feature = "encryption")]
+    let builder = builder.manage(providers::crypto::SecretsSession::default());
+
+    builder
         .setup(|app| {
-            // On startup, open + scan the index for the saved vault (if any).
-            // Failures here are non-fatal: the app still runs without search.
+            // On startup, open the active vault's backend (plain always; an
+            // encrypted vault only if it can be unlocked silently). Non-fatal:
+            // the app still runs without a backend.
             let handle = app.handle().clone();
-            if let Some(root) = vault::saved_vault_root(&handle) {
-                let state = handle.state::<AppState>();
-                if let Err(e) = index::init_for_vault(&handle, &state, Path::new(&root)) {
-                    eprintln!("Index init failed: {e}");
-                }
-            }
+            let state = handle.state::<AppState>();
+            providers::open_active_on_startup(&handle, &state);
             // Rehydrate the AI chat history from disk.
             let ai_state = handle.state::<AppAiState>();
             ai::load_history(&handle, &ai_state);
@@ -43,6 +45,18 @@ pub fn run() {
             vaults::remove_vault,
             vaults::rename_vault,
             vaults::switch_vault,
+            providers::list_providers,
+            providers::active_capabilities,
+            #[cfg(feature = "provider-encrypted-db")]
+            providers::encrypted_db::create_encrypted_vault,
+            #[cfg(feature = "provider-encrypted-db")]
+            providers::encrypted_db::vault_needs_unlock,
+            #[cfg(feature = "provider-encrypted-db")]
+            providers::encrypted_db::unlock_vault,
+            #[cfg(feature = "provider-encrypted-db")]
+            providers::encrypted_db::unlock_remembered,
+            #[cfg(feature = "provider-encrypted-db")]
+            providers::encrypted_db::lock_vault,
             vault::scan_vault,
             vault::read_note,
             vault::write_note,
@@ -51,6 +65,7 @@ pub fn run() {
             vault::rename_path,
             vault::trash_path,
             vault::save_attachment,
+            vault::read_attachment_data_url,
             vault::resolve_note,
             vault::resolve_or_create_note,
             vault::reveal_in_finder,
