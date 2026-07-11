@@ -126,10 +126,24 @@ pub async fn set_ai_settings(
     )
 }
 
-/// Lists model ids from the configured provider (`GET {baseUrl}/models`).
+/// Lists model ids from the provider (`GET {baseUrl}/models`).
+///
+/// The settings panel calls this before anything is saved, so the form's
+/// current values arrive as overrides: `base_url` (if non-empty) replaces the
+/// stored one, and `api_key` (if non-empty) replaces the stored key.
 #[tauri::command]
-pub async fn list_ai_models(app: tauri::AppHandle) -> Result<Vec<String>, String> {
-    let settings = load(&app)?;
+pub async fn list_ai_models(
+    app: tauri::AppHandle,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> Result<Vec<String>, String> {
+    let mut settings = load(&app)?;
+    if let Some(url) = base_url.filter(|u| !u.trim().is_empty()) {
+        settings.base_url = url;
+    }
+    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+        settings.api_key = key;
+    }
     if settings.base_url.trim().is_empty() {
         return Err("Set an AI base URL first.".into());
     }

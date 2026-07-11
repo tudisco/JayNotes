@@ -60,7 +60,9 @@
     fetchStatus = "loading";
     fetchError = "";
     try {
-      models = await invoke<string[]>("list_ai_models");
+      // Pass the form's current values so Fetch works before Save; empty
+      // strings fall back to whatever is already stored.
+      models = await invoke<string[]>("list_ai_models", { baseUrl, apiKey });
       fetchStatus = "idle";
       if (models.length === 0) {
         fetchStatus = "error";
