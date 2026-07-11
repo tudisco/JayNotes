@@ -10,11 +10,17 @@
     vaultPath,
   } from "$lib/stores/vault";
   import FileTree from "./FileTree.svelte";
+  import RecentList from "./RecentList.svelte";
   import ContextMenu from "./ContextMenu.svelte";
   import SearchPanel from "./SearchPanel.svelte";
   import TagsPanel from "./TagsPanel.svelte";
   import SettingsMenu from "./SettingsMenu.svelte";
-  import { sidebarMode, searchFocusNonce } from "$lib/stores/ui";
+  import {
+    sidebarMode,
+    searchFocusNonce,
+    filesView,
+    toggleFilesView,
+  } from "$lib/stores/ui";
 
   function showFiles(): void {
     sidebarMode.set("files");
@@ -138,6 +144,34 @@
           <button
             type="button"
             class="tool-btn"
+            class:active={$filesView === "recent"}
+            title={$filesView === "recent" ? "Folder tree" : "Sort by recent"}
+            aria-label={$filesView === "recent" ? "Folder tree" : "Sort by recent"}
+            aria-pressed={$filesView === "recent"}
+            onclick={toggleFilesView}
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <circle
+                cx="8"
+                cy="8"
+                r="6"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+              <path
+                d="M8 4.5V8l2.5 1.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="tool-btn"
             title="New note"
             aria-label="New note"
             onclick={handleNewNote}
@@ -198,6 +232,8 @@
           Open Vault
         </button>
       </div>
+    {:else if $filesView === "recent"}
+      <RecentList />
     {:else if $fileTree}
       {#if $fileTree.children.length === 0}
         <div class="empty-tree">No notes yet</div>
@@ -318,6 +354,11 @@
   .tool-btn:hover {
     background-color: var(--hover);
     color: var(--accent);
+  }
+
+  .tool-btn.active {
+    color: var(--accent);
+    background-color: var(--hover);
   }
 
   .empty-tree {
