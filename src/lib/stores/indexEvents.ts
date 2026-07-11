@@ -26,6 +26,17 @@ export const vaultChanged = writable<{ paths: string[]; seq: number }>({
   seq: 0,
 });
 
+/**
+ * Increments after the app itself saves a note. Self-writes are suppressed by
+ * the watcher (so `vaultChanged` never fires for them); recency-ordered views
+ * subscribe to this to stay live while the user edits.
+ */
+export const noteSaved = writable(0);
+
+export function notifyNoteSaved(): void {
+  noteSaved.update((n) => n + 1);
+}
+
 let unlisten: UnlistenFn | null = null;
 let seq = 0;
 

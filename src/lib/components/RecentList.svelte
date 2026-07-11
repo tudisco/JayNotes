@@ -1,6 +1,6 @@
 <script lang="ts">
   import { listNotes, type NoteRef } from "$lib/stores/search";
-  import { vaultChanged } from "$lib/stores/indexEvents";
+  import { noteSaved, vaultChanged } from "$lib/stores/indexEvents";
   import {
     commitRename,
     openContextMenu,
@@ -24,12 +24,17 @@
   }
 
   // Initial load (also fires when this list becomes the active view, since the
-  // component mounts only then) and refresh on every external vault change.
+  // component mounts only then), refresh on every external vault change, and on
+  // every in-app save (self-writes never emit `vault-changed`, so without
+  // `noteSaved` the list wouldn't re-sort while the user edits).
   let lastSeq = -1;
+  let lastSaveSeq = -1;
   $effect(() => {
     const seq = $vaultChanged.seq;
-    if (seq !== lastSeq) {
+    const saveSeq = $noteSaved;
+    if (seq !== lastSeq || saveSeq !== lastSaveSeq) {
       lastSeq = seq;
+      lastSaveSeq = saveSeq;
       load();
     }
   });

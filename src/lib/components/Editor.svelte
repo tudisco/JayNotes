@@ -35,6 +35,7 @@
   import { invoke, convertFileSrc } from "@tauri-apps/api/core";
   import { get } from "svelte/store";
   import { vaultPath, vaultError } from "$lib/stores/vault";
+  import { notifyNoteSaved } from "$lib/stores/indexEvents";
   import { isRelativeUrl } from "$lib/utils/url";
 
   /** A `[[...]]` run that stays on one line and holds no brackets itself. */
@@ -253,6 +254,7 @@
       lastSavedBody = body;
       lastSavedFrontmatter = fm;
       status = "saved";
+      notifyNoteSaved();
     } catch (e) {
       status = "idle";
       vaultError.set(String(e));
