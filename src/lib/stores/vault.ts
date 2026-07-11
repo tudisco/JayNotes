@@ -173,6 +173,18 @@ export async function newNote(targetDir: string): Promise<void> {
 }
 
 /**
+ * Creates a note named `name` in the vault root (".md" appended by the backend
+ * if missing) and opens it. Used by the quick switcher's "create" affordance.
+ * Returns the created relative path.
+ */
+export async function createNamedNote(name: string): Promise<string> {
+  const created = await invoke<string>("create_note", { relPath: name });
+  await refreshTree();
+  selected.set({ path: created, isDir: false });
+  return created;
+}
+
+/**
  * Creates an auto-named folder inside `targetDir`, selects it, and puts it
  * into inline-rename mode. Unique naming uses the already-loaded tree.
  */

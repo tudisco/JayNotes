@@ -1,20 +1,53 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import EditorPane from "$lib/components/EditorPane.svelte";
-  import { initVault } from "$lib/stores/vault";
+  import QuickSwitcher from "$lib/components/QuickSwitcher.svelte";
+  import { initVault, newNote, vaultError, vaultPath } from "$lib/stores/vault";
   import { initIndexEvents } from "$lib/stores/indexEvents";
+  import { quickSwitcherOpen, searchFocusNonce, sidebarMode } from "$lib/stores/ui";
 
   onMount(() => {
     initVault();
     initIndexEvents();
+    window.addEventListener("keydown", onKeydown);
+    return () => window.removeEventListener("keydown", onKeydown);
   });
+
+  // Single global shortcut handler. Uses metaKey (macOS) or ctrlKey (portable).
+  function onKeydown(event: KeyboardEvent): void {
+    const mod = event.metaKey || event.ctrlKey;
+    if (!mod) return;
+    // While the quick switcher is open it owns the keyboard.
+    if (get(quickSwitcherOpen)) return;
+
+    const key = event.key.toLowerCase();
+    if (key === "p" || key === "o") {
+      event.preventDefault();
+      quickSwitcherOpen.set(true);
+    } else if (key === "f" && event.shiftKey) {
+      event.preventDefault();
+      sidebarMode.set("search");
+      searchFocusNonce.update((n) => n + 1);
+    } else if (key === "e" && !event.shiftKey) {
+      event.preventDefault();
+      sidebarMode.set("files");
+    } else if (key === "n" && !event.shiftKey) {
+      event.preventDefault();
+      if (!get(vaultPath)) return;
+      sidebarMode.set("files");
+      newNote("").catch((e) => vaultError.set(String(e)));
+    }
+  }
 </script>
 
 <div class="app-shell">
   <Sidebar />
   <EditorPane />
 </div>
+
+<QuickSwitcher />
 
 <style>
   .app-shell {

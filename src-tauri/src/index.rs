@@ -28,7 +28,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
@@ -356,6 +357,56 @@ pub fn extract(raw: &str) -> Extracted {
     }
 }
 
+/// Splits a raw search query into `(text_terms, tag_filters)`. Whitespace
+/// tokens of the form `tag:foo` become tag filters (leading `#` stripped);
+/// everything else is a free-text term. Both are order-preserving.
+fn parse_query(query: &str) -> (Vec<String>, Vec<String>) {
+    let mut terms = Vec::new();
+    let mut tags = Vec::new();
+    for tok in query.split_whitespace() {
+        if let Some(rest) = tok.strip_prefix("tag:") {
+            let t = rest.trim_start_matches('#').trim();
+            if !t.is_empty() {
+                tags.push(t.to_string());
+            }
+        } else {
+            terms.push(tok.to_string());
+        }
+    }
+    (terms, tags)
+}
+
+/// Builds a safe FTS5 MATCH expression from free-text terms. Each term is
+/// emitted as a double-quoted FTS string (internal `"` doubled) so arbitrary
+/// user punctuation — `"`, `(`, `-`, `*` — can never be interpreted as FTS
+/// query syntax. Terms carrying no alphanumeric content (e.g. a lone `*`) are
+/// dropped so we never emit an empty-phrase (`""`) that FTS rejects. A trailing
+/// `*` on the last surviving term gives prefix-as-you-type matching. Returns
+/// `None` when nothing searchable remains.
+fn build_match(terms: &[String]) -> Option<String> {
+    let kept: Vec<&String> = terms
+        .iter()
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let last = kept.len() - 1;
+    let parts: Vec<String> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let escaped = t.replace('"', "\"\"");
+            if i == last {
+                format!("\"{escaped}\"*")
+            } else {
+                format!("\"{escaped}\"")
+            }
+        })
+        .collect();
+    Some(parts.join(" "))
+}
+
 /// Title from a vault-relative path: the file stem (name without `.md`).
 fn title_of(rel: &str) -> String {
     let name = rel.rsplit('/').next().unwrap_or(rel);
@@ -412,6 +463,28 @@ pub struct Index {
 pub struct IndexStatus {
     pub note_count: i64,
     pub last_scan_ms: u64,
+}
+
+/// A single search result. `snippet` may embed `<mark>…</mark>` around matched
+/// terms (raw, un-escaped body text otherwise — the frontend escapes it).
+/// `score` is the bm25 rank (lower = better) or 0.0 for tag-only queries.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub path: String,
+    pub title: String,
+    pub snippet: String,
+    pub score: f64,
+    pub tags: Vec<String>,
+}
+
+/// A lightweight note reference for the quick switcher.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRef {
+    pub path: String,
+    pub title: String,
+    pub mtime: i64,
 }
 
 impl Index {
@@ -762,6 +835,156 @@ impl Index {
         Ok(indexed)
     }
 
+    /// Sorted tag list for one note id.
+    fn tags_for(&self, id: i64) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag FROM tags WHERE note_id = ?1 ORDER BY tag")
+            .map_err(|e| format!("Could not query tags: {e}"))?;
+        let rows = stmt
+            .query_map([id], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("Could not query tags: {e}"))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Full-text + tag search. Parses `tag:` filters out of `query` (ANDed);
+    /// the remainder becomes a sanitized FTS5 MATCH with title weighted over
+    /// body. A tag-only query (no text) returns tagged notes sorted by title.
+    /// An empty query with no tag filters returns nothing.
+    pub fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, String> {
+        let (terms, tags) = parse_query(query);
+        let match_expr = build_match(&terms);
+        if match_expr.is_none() && tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit as i64;
+
+        // Raw rows: (id, path, title, snippet_or_empty, score, body_prefix, body_len).
+        let raw: Vec<(i64, String, String, String, f64, String, i64)> = if let Some(m) = match_expr
+        {
+            let mut sql = String::from(
+                "SELECT n.id, n.path, n.title, \
+                 snippet(notes_fts, 1, '<mark>', '</mark>', '…', 12), \
+                 bm25(notes_fts, 5.0, 1.0), \
+                 substr(notes_fts.body, 1, 100), length(notes_fts.body) \
+                 FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid \
+                 WHERE notes_fts MATCH ?",
+            );
+            let mut binds: Vec<Value> = vec![Value::Text(m)];
+            if !tags.is_empty() {
+                let placeholders = vec!["?"; tags.len()].join(",");
+                sql.push_str(&format!(
+                    " AND n.id IN (SELECT note_id FROM tags WHERE tag IN ({placeholders}) \
+                     GROUP BY note_id HAVING COUNT(DISTINCT tag) = ?)"
+                ));
+                for t in &tags {
+                    binds.push(Value::Text(t.clone()));
+                }
+                binds.push(Value::Integer(tags.len() as i64));
+            }
+            sql.push_str(" ORDER BY bm25(notes_fts, 5.0, 1.0) LIMIT ?");
+            binds.push(Value::Integer(limit));
+
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| format!("Could not prepare search: {e}"))?;
+            let rows = stmt
+                .query_map(params_from_iter(binds), |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })
+                .map_err(|e| format!("Could not run search: {e}"))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| format!("Could not read search row: {e}"))?
+        } else {
+            // Tag-only: no MATCH, so pull the body prefix straight from the FTS row.
+            let placeholders = vec!["?"; tags.len()].join(",");
+            let sql = format!(
+                "SELECT n.id, n.path, n.title, '', 0.0, \
+                 substr(b.body, 1, 100), length(b.body) \
+                 FROM notes n JOIN notes_fts b ON b.rowid = n.id \
+                 WHERE n.id IN (SELECT note_id FROM tags WHERE tag IN ({placeholders}) \
+                 GROUP BY note_id HAVING COUNT(DISTINCT tag) = ?) \
+                 ORDER BY n.title COLLATE NOCASE ASC LIMIT ?"
+            );
+            let mut binds: Vec<Value> = tags.iter().map(|t| Value::Text(t.clone())).collect();
+            binds.push(Value::Integer(tags.len() as i64));
+            binds.push(Value::Integer(limit));
+
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| format!("Could not prepare tag search: {e}"))?;
+            let rows = stmt
+                .query_map(params_from_iter(binds), |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })
+                .map_err(|e| format!("Could not run tag search: {e}"))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| format!("Could not read tag search row: {e}"))?
+        };
+
+        let mut hits = Vec::with_capacity(raw.len());
+        for (id, path, title, snip, score, body_prefix, body_len) in raw {
+            // A snippet with no <mark> means the match was title-only (or a
+            // tag-only query): fall back to the leading body text, no marks.
+            let snippet = if snip.contains("<mark>") {
+                snip
+            } else {
+                let mut s = body_prefix;
+                if body_len > 100 {
+                    s.push('…');
+                }
+                s
+            };
+            let tags = self.tags_for(id)?;
+            hits.push(SearchHit {
+                path,
+                title,
+                snippet,
+                score,
+                tags,
+            });
+        }
+        Ok(hits)
+    }
+
+    /// All notes as `{ path, title, mtime }`, newest first — powers the quick
+    /// switcher (fuzzy matching happens on the frontend).
+    pub fn list_notes(&self) -> Result<Vec<NoteRef>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, title, mtime FROM notes ORDER BY mtime DESC")
+            .map_err(|e| format!("Could not prepare list: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(NoteRef {
+                    path: r.get(0)?,
+                    title: r.get(1)?,
+                    mtime: r.get(2)?,
+                })
+            })
+            .map_err(|e| format!("Could not list notes: {e}"))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| format!("Could not read note row: {e}"))
+    }
+
     /// Reads `(mtime_secs, size)` for a vault-relative note, if it exists.
     fn stat(&self, rel: &str) -> Option<(i64, i64)> {
         let abs = self.vault_root.join(rel);
@@ -862,6 +1085,26 @@ pub async fn index_status(state: tauri::State<'_, AppState>) -> Result<IndexStat
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("No vault is indexed")?;
     index.status()
+}
+
+/// Full-text + tag search over the current vault. `limit` defaults to 50.
+#[tauri::command]
+pub async fn search_notes(
+    state: tauri::State<'_, AppState>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<SearchHit>, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("No vault is indexed")?;
+    index.search(&query, limit.unwrap_or(50))
+}
+
+/// Lists all indexed notes, newest first, for the quick switcher.
+#[tauri::command]
+pub async fn list_notes(state: tauri::State<'_, AppState>) -> Result<Vec<NoteRef>, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("No vault is indexed")?;
+    index.list_notes()
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,6 +1378,185 @@ Duplicate #alpha stays once.";
             .query_row("SELECT path FROM notes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, "other.md");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- query parsing ----
+
+    #[test]
+    fn parse_query_splits_tags_and_terms() {
+        let (terms, tags) = parse_query("hello tag:project world tag:#idea");
+        assert_eq!(terms, vec!["hello", "world"]);
+        assert_eq!(tags, vec!["project", "idea"]);
+
+        let (terms, tags) = parse_query("   tag:only   ");
+        assert!(terms.is_empty());
+        assert_eq!(tags, vec!["only"]);
+    }
+
+    #[test]
+    fn build_match_escapes_and_prefixes() {
+        // Last term gets the prefix star; quotes are doubled.
+        assert_eq!(
+            build_match(&["foo".into(), "bar".into()]).as_deref(),
+            Some("\"foo\" \"bar\"*")
+        );
+        assert_eq!(
+            build_match(&["qu\"ote".into()]).as_deref(),
+            Some("\"qu\"\"ote\"*")
+        );
+        // A lone star carries no alphanumerics and is dropped entirely.
+        assert!(build_match(&["*".into()]).is_none());
+        assert!(build_match(&[]).is_none());
+    }
+
+    // ---- search ----
+
+    #[test]
+    fn search_tag_filter_uses_and_semantics() {
+        let root = make_temp_dir("search-tags");
+        let index = mem_index(&root);
+        index
+            .index_file("a.md", "---\ntags: [alpha, beta]\n---\nApple body")
+            .unwrap();
+        index
+            .index_file("b.md", "---\ntags: [alpha]\n---\nBanana body")
+            .unwrap();
+
+        // Both tags required: only a.md qualifies.
+        let hits = index.search("tag:alpha tag:beta", 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "a.md");
+        assert!(hits[0].tags.contains(&"beta".to_string()));
+
+        // Single tag matches both, sorted by title.
+        let hits = index.search("tag:alpha", 50).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["a.md", "b.md"]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn search_prefix_matches_partial_word() {
+        let root = make_temp_dir("search-prefix");
+        let index = mem_index(&root);
+        index.index_file("n.md", "# Note\nThe programmer wrote code.").unwrap();
+
+        // "progr" should prefix-match "programmer".
+        let hits = index.search("progr", 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("<mark>"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn search_weights_title_over_body() {
+        let root = make_temp_dir("search-weight");
+        let index = mem_index(&root);
+        // One note has "meeting" in the title, another only in the body.
+        index.index_file("meeting.md", "# meeting\nUnrelated content here.").unwrap();
+        index
+            .index_file("other.md", "# other\nWe had a meeting yesterday.")
+            .unwrap();
+
+        let hits = index.search("meeting", 50).unwrap();
+        assert_eq!(hits.len(), 2);
+        // bm25 is lower (better) for the title hit; it must rank first.
+        assert_eq!(hits[0].path, "meeting.md");
+        assert!(hits[0].score <= hits[1].score);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn search_snippet_marks_body_match() {
+        let root = make_temp_dir("search-snip");
+        let index = mem_index(&root);
+        index
+            .index_file("n.md", "# Title\nA quick brown fox jumps over.")
+            .unwrap();
+
+        let hits = index.search("brown", 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("<mark>brown</mark>"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn search_title_only_match_falls_back_to_body_prefix() {
+        let root = make_temp_dir("search-fallback");
+        let index = mem_index(&root);
+        index
+            .index_file("Zebra.md", "The body never mentions the search term.")
+            .unwrap();
+
+        // Matches the title only; snippet should be plain body text, no marks.
+        let hits = index.search("zebra", 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].snippet.contains("<mark>"));
+        assert!(hits[0].snippet.starts_with("The body"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn search_hostile_input_never_errors() {
+        let root = make_temp_dir("search-hostile");
+        let index = mem_index(&root);
+        index.index_file("a.md", "# A\nHarmless body text.").unwrap();
+
+        for q in [
+            "\"quo\"tes",
+            "foo(",
+            "-bar",
+            "*",
+            "**",
+            "( ) \"",
+            "AND OR NOT",
+            "tag:",
+            "col:on tag:x",
+            "\"",
+            ")))",
+        ] {
+            let r = index.search(q, 50);
+            assert!(r.is_ok(), "query {q:?} errored: {:?}", r.err());
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn search_empty_query_returns_nothing() {
+        let root = make_temp_dir("search-empty");
+        let index = mem_index(&root);
+        index.index_file("a.md", "# A\nBody.").unwrap();
+        assert!(index.search("   ", 50).unwrap().is_empty());
+        assert!(index.search("", 50).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_notes_sorted_by_mtime_desc() {
+        let root = make_temp_dir("list-notes");
+        let index = mem_index(&root);
+        // upsert directly with explicit mtimes to control ordering.
+        index.upsert("old.md", "# Old", 100, 5).unwrap();
+        index.upsert("new.md", "# New", 300, 5).unwrap();
+        index.upsert("mid.md", "# Mid", 200, 5).unwrap();
+
+        let notes = index.list_notes().unwrap();
+        assert_eq!(
+            notes.iter().map(|n| n.path.as_str()).collect::<Vec<_>>(),
+            vec!["new.md", "mid.md", "old.md"]
+        );
+        assert_eq!(notes[0].title, "new");
 
         std::fs::remove_dir_all(&root).ok();
     }

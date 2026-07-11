@@ -39,6 +39,8 @@ pub fn run() {
             vault::reveal_in_finder,
             index::reindex_vault,
             index::index_status,
+            index::search_notes,
+            index::list_notes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

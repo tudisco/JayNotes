@@ -12,6 +12,17 @@
   } from "$lib/stores/vault";
   import FileTree from "./FileTree.svelte";
   import ContextMenu from "./ContextMenu.svelte";
+  import SearchPanel from "./SearchPanel.svelte";
+  import { sidebarMode, searchFocusNonce } from "$lib/stores/ui";
+
+  function showFiles(): void {
+    sidebarMode.set("files");
+  }
+
+  function showSearch(): void {
+    sidebarMode.set("search");
+    searchFocusNonce.update((n) => n + 1);
+  }
 
   const themeLabels: Record<ThemeMode, string> = {
     light: "Light",
@@ -47,7 +58,63 @@
     <span class="brand-name">JayNotes</span>
   </div>
 
+  {#if $vaultPath}
+    <div class="tabs" role="tablist" aria-label="Sidebar view">
+      <button
+        type="button"
+        role="tab"
+        class="tab"
+        class:active={$sidebarMode === "files"}
+        aria-selected={$sidebarMode === "files"}
+        title="Files (Cmd+E)"
+        onclick={showFiles}
+      >
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+          <path
+            d="M1.5 3.5a1 1 0 0 1 1-1h3l1.5 2h6.5a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-9z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span>Files</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="tab"
+        class:active={$sidebarMode === "search"}
+        aria-selected={$sidebarMode === "search"}
+        title="Search (Cmd+Shift+F)"
+        onclick={showSearch}
+      >
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+          <circle
+            cx="7"
+            cy="7"
+            r="4.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+          />
+          <path
+            d="M10.5 10.5L14 14"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+          />
+        </svg>
+        <span>Search</span>
+      </button>
+    </div>
+  {/if}
+
   <nav class="notes">
+    {#if $vaultPath && $sidebarMode === "search"}
+      <SearchPanel />
+    {:else}
     <div class="section-header">
       <span class="section-label">Notes</span>
       {#if $vaultPath}
@@ -122,6 +189,7 @@
         <FileTree nodes={$fileTree.children} />
       {/if}
     {/if}
+    {/if}
 
     {#if $vaultError}
       <div class="error" role="alert">{$vaultError}</div>
@@ -165,8 +233,43 @@
     letter-spacing: -0.01em;
   }
 
+  .tabs {
+    display: flex;
+    gap: 2px;
+    padding: 6px 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .tab {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    flex: 1;
+    padding: 7px 8px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .tab:hover {
+    color: var(--text);
+  }
+
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
   .notes {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: 12px 8px;
   }
