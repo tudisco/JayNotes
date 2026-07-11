@@ -113,6 +113,12 @@ Paste or drag an image into the editor → saved as a real file under `attachmen
 **M8 — Tags panel** *(added 2026-07-10 after v1 shipped)*
 Third sidebar tab "Tags" next to Files/Search: `list_tags()` Rust command (tag + note count from the tags table), tag list with counts, click a tag → notes carrying it (reuses `tag:` search), click note opens. Refreshes on vault-changed events.
 
+**M13 — Multi-vault** *(feature_vault_upgrade branch, added 2026-07-11)*
+Settings gain `vaults: [{id, name, path, kind}]` + `activeVaultId` (migrating the old single `vaultPath`). Vault switcher UI (add existing / create new / remove / switch; remembers all vaults). Startup pruning: a vault whose folder is gone from a MOUNTED volume is auto-removed (with a notice); a vault on an unmounted volume (external drive) is kept and shown "offline". Atomic writes (temp+rename) everywhere for Syncthing safety. Index/watcher already per-vault; re-init on switch.
+
+**M14 — Encrypted vault (rclone-crypt)** *(feature_vault_upgrade branch)*
+New vault kind `crypt` using the local RcloneCryptRustLib (path dep, rclone-compatible: AES-EME names, XSalsa20-Poly1305 chunked content, scrypt KDF). VaultBackend abstraction: plain fs vs crypt (decrypt names on scan, streaming read, encrypt_to+rename write). Password prompt per session; optional cross-platform keyring remember (`keyring` crate); KDF layer designed so a FIDO2 hmac-secret/PRF passkey can slot in later (phase 2). SQLCipher-encrypted FTS index for crypt vaults (bundled-sqlcipher). Images via loopback decrypting proxy (crib GeoReel's crypt_proxy). AI revisions for crypt vaults stored inside the encrypted backing. Syncthing: ciphertext `*.sync-conflict-*` files are detected, name-decrypted, and surfaced in the tree as openable conflict notes.
+
 ## Verification
 
 - Each milestone: run `npm run tauri dev` and exercise the feature by hand (create/edit/search notes).
