@@ -14,7 +14,7 @@ use tauri::ipc::Channel;
 use walkdir::WalkDir;
 
 use super::revisions::Revisions;
-use super::{AiEvent, AppAiState};
+use super::{AiEvent, AppAiState, Gate};
 use crate::index::{AppState, Index};
 use crate::vault;
 
@@ -140,10 +140,18 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             "move_note",
-            "RELOCATE a note into a different folder, keeping its file name. The destination folder is created if missing. Use this (not rename_note) to organize notes into folders.",
+            "RELOCATE a note into a different folder, keeping its file name. The destination folder is created if missing. Requires explicit user approval before it runs. Use this (not rename_note) to organize notes into folders.",
             obj(json!({
                 "path": { "type": "string" },
                 "destination_folder": { "type": "string", "description": "Target folder relative path; empty string means the vault root." }
+            }), &["path", "destination_folder"]),
+        ),
+        tool(
+            "move_folder",
+            "RELOCATE an entire folder (and everything inside it) into a different parent folder. The destination parent is created if missing. A folder cannot be moved into itself or one of its own subfolders. Requires explicit user approval before it runs.",
+            obj(json!({
+                "path": { "type": "string", "description": "The folder to move (vault-relative)." },
+                "destination_folder": { "type": "string", "description": "Target parent folder relative path; empty string means the vault root." }
             }), &["path", "destination_folder"]),
         ),
         tool(
@@ -153,13 +161,18 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             "delete_note",
-            "Move a note to the Trash. This requires explicit user approval before it runs.",
+            "Move a note to the Trash. Requires explicit user approval before it runs.",
             obj(json!({ "path": { "type": "string" } }), &["path"]),
         ),
         tool(
             "batch_delete",
             "Move several notes to the Trash at once. Requires a single explicit user approval covering all of them.",
             obj(json!({ "paths": { "type": "array", "items": { "type": "string" } } }), &["paths"]),
+        ),
+        tool(
+            "delete_folder",
+            "Move an entire folder (and everything inside it) to the Trash as one restorable unit. Requires a single explicit user approval covering all contained notes.",
+            obj(json!({ "path": { "type": "string", "description": "The folder to delete (vault-relative)." } }), &["path"]),
         ),
     ]
 }
@@ -171,9 +184,9 @@ pub fn summarize_args(name: &str, args: &Value) -> String {
         "search_notes" => format!("\"{}\"", s("query")),
         "notes_by_tag" => format!("#{}", s("tag")),
         "read_note" | "note_links" | "create_note" | "update_note" | "append_to_note"
-        | "delete_note" | "create_folder" => s("path").to_string(),
+        | "delete_note" | "delete_folder" | "create_folder" => s("path").to_string(),
         "rename_note" => format!("{} → {}", s("old_path"), s("new_path")),
-        "move_note" => {
+        "move_note" | "move_folder" => {
             let dest = s("destination_folder");
             format!("{} → {}/", s("path"), if dest.is_empty() { "(root)" } else { dest })
         }
@@ -211,10 +224,16 @@ async fn try_dispatch(ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result
         "update_note" => update_note(ctx, arg_str(args, "path")?, arg_str(args, "content")?),
         "append_to_note" => append_to_note(ctx, arg_str(args, "path")?, arg_str(args, "content")?),
         "rename_note" => rename_note(ctx, arg_str(args, "old_path")?, arg_str(args, "new_path")?),
-        "move_note" => move_note(ctx, arg_str(args, "path")?, arg_str(args, "destination_folder").unwrap_or("")),
+        "move_note" => {
+            move_note(ctx, arg_str(args, "path")?, arg_str(args, "destination_folder").unwrap_or("")).await
+        }
+        "move_folder" => {
+            move_folder(ctx, arg_str(args, "path")?, arg_str(args, "destination_folder").unwrap_or("")).await
+        }
         "create_folder" => create_folder(ctx, arg_str(args, "path")?),
         "delete_note" => delete_note(ctx, arg_str(args, "path")?).await,
         "batch_delete" => batch_delete(ctx, args).await,
+        "delete_folder" => delete_folder(ctx, arg_str(args, "path")?).await,
         other => Err(format!("Unknown tool '{other}'")),
     }
 }
@@ -355,12 +374,23 @@ fn rename_note(ctx: &ToolContext<'_>, old_path: &str, new_path: &str) -> Result<
     ))
 }
 
-fn move_note(ctx: &ToolContext<'_>, path: &str, dest_folder: &str) -> Result<ToolOutcome, String> {
+/// Gated: emits a "move" permission request and awaits approval before moving.
+/// Validation (source exists, no collision) happens BEFORE the gate so the user
+/// is never asked to approve an operation that would fail anyway.
+async fn move_note(
+    ctx: &ToolContext<'_>,
+    path: &str,
+    dest_folder: &str,
+) -> Result<ToolOutcome, String> {
     let file_name = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| format!("Invalid note path: {path}"))?;
-    let dest = dest_folder.trim().trim_matches('/');
+    let src_abs = vault::safe_join(&ctx.root, path)?;
+    if !src_abs.is_file() {
+        return Err(format!("Note does not exist: {path}"));
+    }
+    let dest = dest_folder.trim().trim_matches('/').to_string();
     let new_path = if dest.is_empty() {
         file_name.clone()
     } else {
@@ -369,18 +399,77 @@ fn move_note(ctx: &ToolContext<'_>, path: &str, dest_folder: &str) -> Result<Too
     if new_path == path {
         return Err("The note is already in that folder".into());
     }
-    // Create the destination folder if needed (harmless if it exists).
-    if !dest.is_empty() {
-        let dest_abs = vault::safe_join(&ctx.root, dest)?;
-        if !dest_abs.exists() {
-            vault::create_folder_at(&ctx.root, dest)?;
-        }
+    if vault::safe_join(&ctx.root, &new_path)?.exists() {
+        return Err(format!("'{new_path}' already exists"));
     }
+
+    if !ctx
+        .ai
+        .request_permission(Gate::moving(vec![path.to_string()], dest.clone()), ctx.channel)
+        .await
+    {
+        return Ok(denied(&[path]));
+    }
+    // rename_at creates the destination folder (parent dirs) as needed.
     vault::rename_at(&ctx.root, ctx.state, path, &new_path)?;
     let shown = if dest.is_empty() { "(vault root)".to_string() } else { format!("{dest}/") };
     Ok(ToolOutcome::ok(
         json!({ "old_path": path, "new_path": new_path }),
         format!("Moved {path} → {shown}"),
+    ))
+}
+
+/// Gated: moves an entire folder under a new parent. Refuses self-nesting
+/// (moving a folder into itself or a descendant), validates collisions before
+/// asking for permission, and reuses `rename_at`, whose index rename already
+/// rewrites every contained note path by prefix.
+async fn move_folder(
+    ctx: &ToolContext<'_>,
+    path: &str,
+    dest_folder: &str,
+) -> Result<ToolOutcome, String> {
+    let path = path.trim().trim_matches('/').to_string();
+    if path.is_empty() {
+        return Err("A folder path is required (the vault root cannot be moved)".into());
+    }
+    let abs = vault::safe_join(&ctx.root, &path)?;
+    if !abs.is_dir() {
+        return Err(format!("Folder does not exist: {path}"));
+    }
+    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+    let dest = dest_folder.trim().trim_matches('/').to_string();
+    if dest == path || dest.starts_with(&format!("{path}/")) {
+        return Err(format!(
+            "Cannot move '{path}' into itself or one of its own subfolders"
+        ));
+    }
+    let new_path = if dest.is_empty() {
+        name.clone()
+    } else {
+        format!("{dest}/{name}")
+    };
+    if new_path == path {
+        return Err("The folder is already in that location".into());
+    }
+    if vault::safe_join(&ctx.root, &new_path)?.exists() {
+        return Err(format!("'{new_path}' already exists"));
+    }
+
+    if !ctx
+        .ai
+        .request_permission(Gate::moving(vec![path.clone()], dest.clone()), ctx.channel)
+        .await
+    {
+        return Ok(denied(&[&path]));
+    }
+    // rename_at registers self-writes for both folder rels (as rename_path
+    // does), creates the destination parent, renames the directory on disk,
+    // and calls Index::rename — which updates every `path/…` note by prefix.
+    vault::rename_at(&ctx.root, ctx.state, &path, &new_path)?;
+    let shown = if dest.is_empty() { "(vault root)".to_string() } else { format!("{dest}/") };
+    Ok(ToolOutcome::ok(
+        json!({ "old_path": path, "new_path": new_path }),
+        format!("Moved folder {path} → {shown}"),
     ))
 }
 
@@ -392,7 +481,11 @@ fn create_folder(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, Strin
 // ---- gated (destructive) tools ----
 
 async fn delete_note(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> {
-    if !ctx.ai.request_permission("delete", vec![path.to_string()], ctx.channel).await {
+    if !ctx
+        .ai
+        .request_permission(Gate::delete(vec![path.to_string()]), ctx.channel)
+        .await
+    {
         return Ok(denied(&[path]));
     }
     vault::trash_at(&ctx.root, ctx.state, path)?;
@@ -408,7 +501,11 @@ async fn batch_delete(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutcome
     if paths.is_empty() {
         return Err("No paths provided to batch_delete".into());
     }
-    if !ctx.ai.request_permission("delete", paths.clone(), ctx.channel).await {
+    if !ctx
+        .ai
+        .request_permission(Gate::delete(paths.clone()), ctx.channel)
+        .await
+    {
         let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
         return Ok(denied(&refs));
     }
@@ -425,6 +522,65 @@ async fn batch_delete(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutcome
         result: json!({ "deleted": deleted, "errors": errors }).to_string(),
         summary,
         detail: (!errors.is_empty()).then(|| errors.join("; ")),
+        revision_id: None,
+    })
+}
+
+/// Gated: deletes an entire folder. Presented to the user like a batch delete —
+/// the permission request enumerates every contained `.md` note in `paths` and
+/// carries the folder itself in the `folder` field (the UI truncates long
+/// lists). On approval the folder is trashed AS ONE UNIT via
+/// [`vault::trash_at`]: a single `trash::delete` on the directory produces one
+/// cleanly-restorable Trash entry, and `trash_at` then prunes the whole subtree
+/// from the index with `remove_prefix`. Reuse `trash_at` the same way for any
+/// future batch-ish gated delete — it is the one-call "trash + reindex" helper
+/// for both files and directories.
+async fn delete_folder(ctx: &ToolContext<'_>, path: &str) -> Result<ToolOutcome, String> {
+    let path = path.trim().trim_matches('/').to_string();
+    if path.is_empty() {
+        return Err("A folder path is required (the vault root cannot be deleted)".into());
+    }
+    let abs = vault::safe_join(&ctx.root, &path)?;
+    if !abs.is_dir() {
+        return Err(format!("Folder does not exist: {path}"));
+    }
+
+    // Enumerate contained notes so the user sees exactly what approval covers.
+    let mut notes: Vec<String> = Vec::new();
+    for entry in WalkDir::new(&abs)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+    {
+        let entry = entry.map_err(|e| format!("Error scanning folder: {e}"))?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if entry
+            .path()
+            .extension()
+            .map(|x| x.eq_ignore_ascii_case("md"))
+            .unwrap_or(false)
+        {
+            if let Ok(rel) = vault::to_rel_string(&ctx.root, entry.path()) {
+                notes.push(rel);
+            }
+        }
+    }
+    notes.sort();
+
+    if !ctx
+        .ai
+        .request_permission(Gate::delete_folder(path.clone(), notes.clone()), ctx.channel)
+        .await
+    {
+        return Ok(denied(&[&path]));
+    }
+    vault::trash_at(&ctx.root, ctx.state, &path)?;
+    Ok(ToolOutcome {
+        result: json!({ "folder": path, "deleted": true, "notes": notes }).to_string(),
+        summary: format!("Deleted folder {path} ({} note(s))", notes.len()),
+        detail: (!notes.is_empty()).then(|| notes.join(", ")),
         revision_id: None,
     })
 }
@@ -464,7 +620,8 @@ mod tests {
         for expected in [
             "search_notes", "list_notes", "list_folders", "list_tags", "notes_by_tag",
             "read_note", "note_links", "create_note", "update_note", "append_to_note",
-            "rename_note", "move_note", "create_folder", "delete_note", "batch_delete",
+            "rename_note", "move_note", "move_folder", "create_folder", "delete_note",
+            "batch_delete", "delete_folder",
         ] {
             assert!(names.contains(&expected.to_string()), "missing schema: {expected}");
         }
@@ -628,7 +785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_note_to_existing_new_and_collision() {
+    async fn move_note_approved_to_existing_new_and_collision() {
         let root = temp_vault("move");
         let state = state_with_index(&root, &[]);
         std::fs::create_dir_all(root.join("existing")).unwrap();
@@ -639,22 +796,192 @@ mod tests {
         let ch = noop_channel();
         let ctx = ctx_for(&state, &ai, &ch, &root, root.join(".rev"));
 
-        // move into an existing folder
-        let m1 = dispatch(&ctx, "move_note", &json!({"path":"a.md","destination_folder":"existing"})).await;
+        // move into an existing folder (approved)
+        let m1_args = json!({"path":"a.md","destination_folder":"existing"});
+        let (m1, _) = tokio::join!(
+            dispatch(&ctx, "move_note", &m1_args),
+            answer_next_permission(&ai, true),
+        );
         assert!(m1.summary.starts_with("Moved a.md → existing/"), "{}", m1.summary);
         assert!(root.join("existing/a.md").exists());
         assert!(!root.join("a.md").exists());
 
-        // move into a new folder (auto-created)
-        let m2 = dispatch(&ctx, "move_note", &json!({"path":"b.md","destination_folder":"fresh/deep"})).await;
+        // move into a new folder (auto-created, approved)
+        let m2_args = json!({"path":"b.md","destination_folder":"fresh/deep"});
+        let (m2, _) = tokio::join!(
+            dispatch(&ctx, "move_note", &m2_args),
+            answer_next_permission(&ai, true),
+        );
         assert!(m2.result.contains("fresh/deep/b.md"), "{}", m2.result);
         assert!(root.join("fresh/deep/b.md").exists());
 
-        // collision: existing/c.md already there
+        // collision: fails validation BEFORE any permission request.
         std::fs::write(root.join("c.md"), "c2").unwrap();
         let m3 = dispatch(&ctx, "move_note", &json!({"path":"c.md","destination_folder":"existing"})).await;
         assert!(m3.result.starts_with("Error:"), "{}", m3.result);
         assert!(root.join("c.md").exists(), "collision must not move the source");
+        assert!(ai.pending.lock().unwrap().is_empty(), "no gate for invalid moves");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn move_note_denied_leaves_file_in_place() {
+        let root = temp_vault("move-deny");
+        let state = state_with_index(&root, &[]);
+        std::fs::write(root.join("stay.md"), "body").unwrap();
+        let ai = AppAiState::default();
+        let ch = noop_channel();
+        let ctx = ctx_for(&state, &ai, &ch, &root, root.join(".rev"));
+
+        let args = json!({"path":"stay.md","destination_folder":"elsewhere"});
+        let (out, _) = tokio::join!(
+            dispatch(&ctx, "move_note", &args),
+            answer_next_permission(&ai, false),
+        );
+        assert!(out.result.contains("\"denied\":true"), "{}", out.result);
+        assert!(root.join("stay.md").exists(), "denied move must not relocate the file");
+        assert!(!root.join("elsewhere").exists(), "denied move must not create the folder");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn move_folder_approved_updates_tree_and_index() {
+        let root = temp_vault("move-folder");
+        std::fs::create_dir_all(root.join("proj/sub")).unwrap();
+        std::fs::write(root.join("proj/x.md"), "x").unwrap();
+        std::fs::write(root.join("proj/sub/y.md"), "y").unwrap();
+        let state = state_with_index(&root, &[("proj/x.md", "x"), ("proj/sub/y.md", "y")]);
+        let ai = AppAiState::default();
+        let ch = noop_channel();
+        let ctx = ctx_for(&state, &ai, &ch, &root, root.join(".rev"));
+
+        let args = json!({"path":"proj","destination_folder":"archive"});
+        let (out, _) = tokio::join!(
+            dispatch(&ctx, "move_folder", &args),
+            answer_next_permission(&ai, true),
+        );
+        assert!(out.result.contains("archive/proj"), "{}", out.result);
+        assert!(root.join("archive/proj/x.md").exists());
+        assert!(root.join("archive/proj/sub/y.md").exists());
+        assert!(!root.join("proj").exists());
+
+        // Index paths were prefix-renamed.
+        let mut paths: Vec<String> = with_index(&ctx, |idx| idx.list_notes())
+            .unwrap()
+            .into_iter()
+            .map(|n| n.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["archive/proj/sub/y.md", "archive/proj/x.md"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn move_folder_rejects_self_nesting_and_collision() {
+        let root = temp_vault("move-folder-bad");
+        std::fs::create_dir_all(root.join("a/sub")).unwrap();
+        std::fs::create_dir_all(root.join("dest/a")).unwrap();
+        let state = state_with_index(&root, &[]);
+        let ai = AppAiState::default();
+        let ch = noop_channel();
+        let ctx = ctx_for(&state, &ai, &ch, &root, root.join(".rev"));
+
+        // Into itself.
+        let s1 = dispatch(&ctx, "move_folder", &json!({"path":"a","destination_folder":"a"})).await;
+        assert!(s1.result.starts_with("Error:"), "{}", s1.result);
+        // Into its own descendant.
+        let s2 = dispatch(&ctx, "move_folder", &json!({"path":"a","destination_folder":"a/sub"})).await;
+        assert!(s2.result.starts_with("Error:"), "{}", s2.result);
+        // Target collision (dest/a already exists).
+        let s3 = dispatch(&ctx, "move_folder", &json!({"path":"a","destination_folder":"dest"})).await;
+        assert!(s3.result.starts_with("Error:"), "{}", s3.result);
+        // All rejected during validation — no permission requests, tree intact.
+        assert!(ai.pending.lock().unwrap().is_empty());
+        assert!(root.join("a/sub").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_folder_approved_removes_dir_and_index_rows() {
+        let root = temp_vault("del-folder");
+        std::fs::create_dir_all(root.join("old/sub")).unwrap();
+        std::fs::write(root.join("old/a.md"), "a").unwrap();
+        std::fs::write(root.join("old/sub/b.md"), "b").unwrap();
+        std::fs::write(root.join("keep.md"), "k").unwrap();
+        let state = state_with_index(
+            &root,
+            &[("old/a.md", "a"), ("old/sub/b.md", "b"), ("keep.md", "k")],
+        );
+        let ai = AppAiState::default();
+        // A capturing channel so we can assert the permission payload shape.
+        let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink = events.clone();
+        let ch: Channel<AiEvent> = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(s) = body {
+                sink.lock().unwrap().push(s);
+            }
+            Ok(())
+        });
+        let ctx = ctx_for(&state, &ai, &ch, &root, root.join(".rev"));
+
+        let args = json!({"path":"old"});
+        let (out, _) = tokio::join!(
+            dispatch(&ctx, "delete_folder", &args),
+            answer_next_permission(&ai, true),
+        );
+        assert!(out.result.contains("\"deleted\":true"), "{}", out.result);
+        assert!(!root.join("old").exists(), "folder gone from the vault");
+        assert!(root.join(".trash/old/a.md").exists(), "trashed as one unit");
+        assert!(root.join("keep.md").exists());
+
+        // Permission event enumerated the contained notes + folder field.
+        let perm = events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.contains("permissionRequest"))
+            .cloned()
+            .expect("a permissionRequest event was emitted");
+        let v: Value = serde_json::from_str(&perm).unwrap();
+        assert_eq!(v["action"], "delete");
+        assert_eq!(v["folder"], "old");
+        let paths: Vec<&str> = v["paths"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+        assert_eq!(paths, vec!["old/a.md", "old/sub/b.md"]);
+
+        // Index rows for all children removed; unrelated note remains.
+        let remaining: Vec<String> = with_index(&ctx, |idx| idx.list_notes())
+            .unwrap()
+            .into_iter()
+            .map(|n| n.path)
+            .collect();
+        assert_eq!(remaining, vec!["keep.md"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_folder_denied_leaves_everything_untouched() {
+        let root = temp_vault("del-folder-deny");
+        std::fs::create_dir_all(root.join("old")).unwrap();
+        std::fs::write(root.join("old/a.md"), "a").unwrap();
+        let state = state_with_index(&root, &[("old/a.md", "a")]);
+        let ai = AppAiState::default();
+        let ch = noop_channel();
+        let ctx = ctx_for(&state, &ai, &ch, &root, root.join(".rev"));
+
+        let args = json!({"path":"old"});
+        let (out, _) = tokio::join!(
+            dispatch(&ctx, "delete_folder", &args),
+            answer_next_permission(&ai, false),
+        );
+        assert!(out.result.contains("\"denied\":true"), "{}", out.result);
+        assert!(root.join("old/a.md").exists(), "denied delete must not touch the folder");
+        let count: Vec<_> = with_index(&ctx, |idx| idx.list_notes()).unwrap();
+        assert_eq!(count.len(), 1, "index untouched on denial");
 
         std::fs::remove_dir_all(&root).ok();
     }
