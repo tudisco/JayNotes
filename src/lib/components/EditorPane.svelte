@@ -127,6 +127,7 @@
 
   // ---- encrypted-vault unlock prompt (shown in the main pane) ----
   let unlockPassword = $state("");
+  let unlockPassword2 = $state("");
   let unlockRemember = $state(false);
   let unlockError = $state("");
   let unlocking = $state(false);
@@ -135,6 +136,7 @@
   $effect(() => {
     void $activeVault?.id;
     unlockPassword = "";
+    unlockPassword2 = "";
     unlockError = "";
   });
 
@@ -145,8 +147,15 @@
     unlocking = true;
     unlockError = "";
     try {
-      await unlockVault(v.id, unlockPassword, unlockRemember);
+      // encrypted-files unlock also needs the rclone salt/second password to
+      // re-derive the same keys; other encrypted kinds ignore `extra`.
+      const extra =
+        v.kind === "encrypted-files" && unlockPassword2
+          ? { password2: unlockPassword2 }
+          : undefined;
+      await unlockVault(v.id, unlockPassword, unlockRemember, extra);
       unlockPassword = "";
+      unlockPassword2 = "";
     } catch (e) {
       unlockError = String(e);
     } finally {
@@ -235,6 +244,15 @@
           placeholder="Password"
           bind:value={unlockPassword}
         />
+        {#if $activeVault.kind === "encrypted-files"}
+          <input
+            class="unlock-input"
+            type="text"
+            autocomplete="off"
+            placeholder="Salt / second password (optional)"
+            bind:value={unlockPassword2}
+          />
+        {/if}
         <label class="unlock-remember">
           <input type="checkbox" bind:checked={unlockRemember} />
           Remember password

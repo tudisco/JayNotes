@@ -29,7 +29,7 @@ export interface ContextMenuState {
 // ---------------------------------------------------------------------------
 
 /** Vault kind, mirrored from the Rust `VaultKind` (`kind()` ids). */
-export type VaultKind = "plain" | "encrypted-db";
+export type VaultKind = "plain" | "encrypted-db" | "encrypted-files";
 
 /** On-disk status of a vault, mirrored from the Rust `VaultStatus`. */
 export type VaultStatus = "ok" | "offline" | "missing" | "unsupported";
@@ -292,13 +292,43 @@ export async function createEncryptedVault(
   return vault.id;
 }
 
-/** Unlocks the given encrypted vault with a password, then opens it. */
+/**
+ * Creates a new encrypted-files vault (a folder of individually-encrypted,
+ * rclone-compatible notes, safe to sync with Syncthing) and opens it. The
+ * optional `password2` is the rclone salt/second password (empty = default).
+ * Returns the new vault id.
+ */
+export async function createEncryptedFilesVault(
+  location: string,
+  name: string,
+  password: string,
+  password2: string,
+  remember: boolean,
+): Promise<string> {
+  const vault = await invoke<VaultInfo>("create_encrypted_files_vault", {
+    location,
+    name,
+    password,
+    password2: password2 || null,
+    remember,
+  });
+  await loadVaults();
+  await activateActive();
+  return vault.id;
+}
+
+/**
+ * Unlocks the given encrypted vault with a password, then opens it. `extra`
+ * carries provider-specific fields (e.g. encrypted-files' optional `password2`
+ * salt) beyond the password.
+ */
 export async function unlockVault(
   id: string,
   password: string,
   remember: boolean,
+  extra?: Record<string, string>,
 ): Promise<void> {
-  await invoke("unlock_vault", { id, password, remember });
+  await invoke("unlock_vault", { id, password, extra: extra ?? null, remember });
   await activateActive();
 }
 

@@ -25,6 +25,7 @@
     vaults,
     activeVaultId,
     providers,
+    createEncryptedFilesVault,
     type VaultInfo,
     type ProviderMeta,
   } from "$lib/stores/vault";
@@ -175,6 +176,14 @@
           configValues.location,
           configValues.name,
           configValues.password,
+          rememberPassword,
+        );
+      } else if (p.kind === "encrypted-files") {
+        await createEncryptedFilesVault(
+          configValues.location,
+          configValues.name,
+          configValues.password,
+          configValues.password2 ?? "",
           rememberPassword,
         );
       } else {
