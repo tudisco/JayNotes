@@ -1,10 +1,30 @@
+mod index;
 mod vault;
+mod watcher;
+
+use std::path::Path;
+
+use index::AppState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(AppState::default())
+        .setup(|app| {
+            // On startup, open + scan the index for the saved vault (if any).
+            // Failures here are non-fatal: the app still runs without search.
+            let handle = app.handle().clone();
+            if let Some(root) = vault::saved_vault_root(&handle) {
+                let state = handle.state::<AppState>();
+                if let Err(e) = index::init_for_vault(&handle, &state, Path::new(&root)) {
+                    eprintln!("Index init failed: {e}");
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             vault::pick_vault,
             vault::get_vault,
@@ -17,6 +37,8 @@ pub fn run() {
             vault::rename_path,
             vault::trash_path,
             vault::reveal_in_finder,
+            index::reindex_vault,
+            index::index_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

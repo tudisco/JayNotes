@@ -92,6 +92,16 @@
     scheduleSave();
   }
 
+  /**
+   * True when the editor holds unsaved changes (body or frontmatter differ from
+   * what's on disk). Used to decide whether an external file change may safely
+   * reload the note without clobbering the user's edits.
+   */
+  export function isDirty(): boolean {
+    if (!crepe || !loaded) return false;
+    return crepe.getMarkdown() !== lastSavedBody || frontmatter !== lastSavedFrontmatter;
+  }
+
   /** Flush + destroy the current editor instance. */
   async function teardown(): Promise<void> {
     if (!crepe) return;

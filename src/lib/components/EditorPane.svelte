@@ -2,6 +2,7 @@
   import Editor from "./Editor.svelte";
   import PropertiesBar from "./PropertiesBar.svelte";
   import { renameNote, selected, vaultError } from "$lib/stores/vault";
+  import { vaultChanged } from "$lib/stores/indexEvents";
 
   let fileSelected = $derived($selected !== null && !$selected.isDir);
   let notePath = $derived(fileSelected ? ($selected as { path: string }).path : null);
@@ -11,6 +12,23 @@
   // through the same Editor writer so their saves can't clobber each other.
   let editor = $state<Editor | undefined>();
   let frontmatter = $state<string | null>(null);
+
+  // Bumping this remounts the Editor (via the {#key} below), forcing a fresh
+  // read from disk. Used to reload the open note after an external change.
+  let reloadNonce = $state(0);
+  let lastSeq = 0;
+
+  // When the watcher reports the open note changed on disk, reload it — but
+  // only if the editor has no unsaved edits, so we never stomp the user's work.
+  $effect(() => {
+    const change = $vaultChanged;
+    if (change.seq === lastSeq) return;
+    lastSeq = change.seq;
+    const p = notePath;
+    if (p && change.paths.includes(p) && editor && !editor.isDirty()) {
+      reloadNonce += 1;
+    }
+  });
 
   function onPropertiesChange(fm: string | null): void {
     frontmatter = fm;
@@ -61,7 +79,7 @@
 <section class="editor-pane" class:has-note={fileSelected}>
   {#if fileSelected && notePath}
     <div class="note-view">
-      {#key notePath}
+      {#key `${notePath}:${reloadNonce}`}
         <div class="note-meta">
           <header class="note-header">
             <input

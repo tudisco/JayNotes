@@ -3,9 +3,11 @@
   import Sidebar from "$lib/components/Sidebar.svelte";
   import EditorPane from "$lib/components/EditorPane.svelte";
   import { initVault } from "$lib/stores/vault";
+  import { initIndexEvents } from "$lib/stores/indexEvents";
 
   onMount(() => {
     initVault();
+    initIndexEvents();
   });
 </script>
 

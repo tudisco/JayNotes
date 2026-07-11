@@ -12,6 +12,8 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use walkdir::WalkDir;
 
+use crate::index::{self, register_write, AppState};
+
 const SETTINGS_FILE: &str = "settings.json";
 
 // ---------------------------------------------------------------------------
@@ -86,6 +88,20 @@ fn vault_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     }
     root.canonicalize()
         .map_err(|e| format!("Could not resolve vault directory: {e}"))
+}
+
+/// Returns the canonicalized saved vault root if one is configured and still
+/// exists on disk, else `None`. Used by startup index initialization, where a
+/// missing/invalid vault should simply mean "no index" rather than an error.
+pub fn saved_vault_root(app: &tauri::AppHandle) -> Option<String> {
+    let settings = load_settings(app).ok()?;
+    let root = PathBuf::from(settings.vault_path?);
+    if !root.is_dir() {
+        return None;
+    }
+    root.canonicalize()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -262,10 +278,14 @@ pub async fn get_vault(app: tauri::AppHandle) -> Result<Option<String>, String> 
         .filter(|p| Path::new(p).is_dir()))
 }
 
-/// Validates that `path` is an existing directory and persists it as the
-/// vault root in settings.json.
+/// Validates that `path` is an existing directory, persists it as the vault
+/// root in settings.json, and (re)opens the search index + file watcher for it.
 #[tauri::command]
-pub async fn set_vault(app: tauri::AppHandle, path: String) -> Result<(), String> {
+pub async fn set_vault(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
     let dir = PathBuf::from(&path);
     if !dir.is_dir() {
         return Err(format!("Not a directory: {path}"));
@@ -275,7 +295,14 @@ pub async fn set_vault(app: tauri::AppHandle, path: String) -> Result<(), String
         .map_err(|e| format!("Could not resolve directory: {e}"))?;
     let mut settings = load_settings(&app)?;
     settings.vault_path = Some(canonical.to_string_lossy().into_owned());
-    save_settings(&app, &settings)
+    save_settings(&app, &settings)?;
+
+    // Swap the index/watcher over to the new vault. A failure here is
+    // non-fatal — the vault is still usable without search.
+    if let Err(e) = index::init_for_vault(&app, &state, &canonical) {
+        eprintln!("Index init failed for {}: {e}", canonical.display());
+    }
+    Ok(())
 }
 
 /// Scans the vault and returns the full folder/.md-file tree.
@@ -300,6 +327,7 @@ pub async fn read_note(app: tauri::AppHandle, rel_path: String) -> Result<String
 #[tauri::command]
 pub async fn write_note(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     rel_path: String,
     content: String,
 ) -> Result<(), String> {
@@ -309,7 +337,11 @@ pub async fn write_note(
         fs::create_dir_all(parent)
             .map_err(|e| format!("Could not create parent folders: {e}"))?;
     }
-    fs::write(&path, content).map_err(|e| format!("Could not write note '{rel_path}': {e}"))
+    // Register the write BEFORE it lands so the watcher never races us.
+    register_write(&state.recent_writes, &rel_path);
+    fs::write(&path, &content).map_err(|e| format!("Could not write note '{rel_path}': {e}"))?;
+    index_upsert(&state, &rel_path, &content);
+    Ok(())
 }
 
 /// Creates an empty note. If `rel_path` is an existing directory (or empty,
@@ -318,7 +350,11 @@ pub async fn write_note(
 /// and it is an error if the file already exists. Returns the created
 /// relative path.
 #[tauri::command]
-pub async fn create_note(app: tauri::AppHandle, rel_path: String) -> Result<String, String> {
+pub async fn create_note(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    rel_path: String,
+) -> Result<String, String> {
     let root = vault_root(&app)?;
     let target = safe_join(&root, &rel_path)?;
 
@@ -346,8 +382,11 @@ pub async fn create_note(app: tauri::AppHandle, rel_path: String) -> Result<Stri
         fs::create_dir_all(parent)
             .map_err(|e| format!("Could not create parent folders: {e}"))?;
     }
+    let created_rel = to_rel_string(&root, &file_path)?;
+    register_write(&state.recent_writes, &created_rel);
     fs::write(&file_path, "").map_err(|e| format!("Could not create note: {e}"))?;
-    to_rel_string(&root, &file_path)
+    index_upsert(&state, &created_rel, "");
+    Ok(created_rel)
 }
 
 /// Creates a folder (and any missing parents). Errors if it already exists.
@@ -369,6 +408,7 @@ pub async fn create_folder(app: tauri::AppHandle, rel_path: String) -> Result<()
 #[tauri::command]
 pub async fn rename_path(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     old_rel: String,
     new_rel: String,
 ) -> Result<(), String> {
@@ -385,19 +425,43 @@ pub async fn rename_path(
         fs::create_dir_all(parent)
             .map_err(|e| format!("Could not create parent folders: {e}"))?;
     }
+    register_write(&state.recent_writes, &old_rel);
+    register_write(&state.recent_writes, &new_rel);
     fs::rename(&old_path, &new_path)
-        .map_err(|e| format!("Could not rename '{old_rel}' to '{new_rel}': {e}"))
+        .map_err(|e| format!("Could not rename '{old_rel}' to '{new_rel}': {e}"))?;
+    if let Ok(guard) = state.index.lock() {
+        if let Some(idx) = guard.as_ref() {
+            let _ = idx.rename(&old_rel, &new_rel);
+        }
+    }
+    Ok(())
 }
 
 /// Moves a file or folder to the OS Trash. Never hard-deletes.
 #[tauri::command]
-pub async fn trash_path(app: tauri::AppHandle, rel_path: String) -> Result<(), String> {
+pub async fn trash_path(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    rel_path: String,
+) -> Result<(), String> {
     let root = vault_root(&app)?;
     let path = safe_join(&root, &rel_path)?;
     if !path.exists() {
         return Err(format!("'{rel_path}' does not exist"));
     }
-    trash::delete(&path).map_err(|e| format!("Could not move '{rel_path}' to Trash: {e}"))
+    let was_dir = path.is_dir();
+    register_write(&state.recent_writes, &rel_path);
+    trash::delete(&path).map_err(|e| format!("Could not move '{rel_path}' to Trash: {e}"))?;
+    if let Ok(guard) = state.index.lock() {
+        if let Some(idx) = guard.as_ref() {
+            let _ = if was_dir {
+                idx.remove_prefix(&rel_path)
+            } else {
+                idx.remove_file(&rel_path)
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Reveals a file or folder in the OS file manager (Finder on macOS).
@@ -410,6 +474,20 @@ pub async fn reveal_in_finder(app: tauri::AppHandle, rel_path: String) -> Result
     }
     tauri_plugin_opener::reveal_item_in_dir(&path)
         .map_err(|e| format!("Could not reveal '{rel_path}': {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Index helper
+// ---------------------------------------------------------------------------
+
+/// Upserts a single note into the search index, if one is open. Best-effort:
+/// an indexing failure never fails the underlying file operation.
+fn index_upsert(state: &tauri::State<'_, AppState>, rel: &str, content: &str) {
+    if let Ok(guard) = state.index.lock() {
+        if let Some(idx) = guard.as_ref() {
+            let _ = idx.index_file(rel, content);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
