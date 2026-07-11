@@ -77,14 +77,17 @@
   async function save(): Promise<void> {
     saveStatus = "saving";
     saveError = "";
-    const temp = temperature.trim();
-    const parsed = temp === "" ? null : Number(temp);
-    if (parsed != null && (Number.isNaN(parsed) || parsed < 0 || parsed > 2)) {
-      saveStatus = "error";
-      saveError = "Temperature must be a number between 0 and 2.";
-      return;
-    }
     try {
+      // The number input binds back a number (or null when cleared), while the
+      // seeding effect assigns strings — coerce before trimming so a touched
+      // temperature field can't throw and strand the status on "Saving…".
+      const temp = String(temperature ?? "").trim();
+      const parsed = temp === "" ? null : Number(temp);
+      if (parsed != null && (Number.isNaN(parsed) || parsed < 0 || parsed > 2)) {
+        saveStatus = "error";
+        saveError = "Temperature must be a number between 0 and 2.";
+        return;
+      }
       await invoke("set_ai_settings", {
         preset,
         baseUrl: baseUrl.trim(),
