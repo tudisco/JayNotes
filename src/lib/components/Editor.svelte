@@ -238,8 +238,11 @@
     }
   }
 
-  /** Persist the current editor content if it differs from what's on disk. */
-  async function flush(): Promise<void> {
+  /**
+   * Persist the current editor content if it differs from what's on disk.
+   * Exported so the AI chat can flush the open note before the model reads it.
+   */
+  export async function flush(): Promise<void> {
     clearSaveTimer();
     if (!crepe || !loaded || !currentPath) return;
     const body = crepe.getMarkdown();

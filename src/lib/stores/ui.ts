@@ -36,6 +36,28 @@ export function toggleFilesView(): void {
 /** Whether the Cmd+P quick switcher modal is open. */
 export const quickSwitcherOpen = writable(false);
 
+const CHAT_OPEN_KEY = "jaynotes:chatOpen";
+
+function initialChatOpen(): boolean {
+  if (typeof localStorage === "undefined") return false;
+  return localStorage.getItem(CHAT_OPEN_KEY) === "true";
+}
+
+/**
+ * Whether the AI assistant sidebar is expanded. Collapsed by default; the state
+ * is persisted to localStorage so it survives restarts.
+ */
+export const chatOpen = writable<boolean>(initialChatOpen());
+
+if (typeof localStorage !== "undefined") {
+  chatOpen.subscribe((v) => localStorage.setItem(CHAT_OPEN_KEY, String(v)));
+}
+
+/** Toggles the AI assistant sidebar (Cmd+Shift+A). */
+export function toggleChat(): void {
+  chatOpen.update((v) => !v);
+}
+
 /**
  * Incremented whenever the search panel should grab focus (e.g. Cmd+Shift+F
  * pressed while it's already visible). The panel watches this and focuses its

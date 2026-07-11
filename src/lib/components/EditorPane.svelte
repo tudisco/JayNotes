@@ -1,10 +1,15 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import Editor from "./Editor.svelte";
   import PropertiesBar from "./PropertiesBar.svelte";
   import { renameNote, selected, vaultError } from "$lib/stores/vault";
   import { vaultChanged } from "$lib/stores/indexEvents";
+  import {
+    editorReloadNonce,
+    registerEditorFlush,
+  } from "$lib/stores/editorBridge";
 
   let fileSelected = $derived($selected !== null && !$selected.isDir);
   let notePath = $derived(fileSelected ? ($selected as { path: string }).path : null);
@@ -31,6 +36,22 @@
       reloadNonce += 1;
     }
   });
+
+  // The AI writes through a suppressed self-write path, so the watcher stays
+  // quiet; the chat bumps this nonce to reload the open note after an edit or
+  // revert. Same safety rule: never reload over unsaved edits.
+  let lastAiReload = 0;
+  $effect(() => {
+    const n = $editorReloadNonce;
+    if (n === lastAiReload) return;
+    lastAiReload = n;
+    if (notePath && editor && !editor.isDirty()) {
+      reloadNonce += 1;
+    }
+  });
+
+  // Let the AI chat flush the open note before the model reads it from disk.
+  onMount(() => registerEditorFlush(async () => { await editor?.flush(); }));
 
   function onPropertiesChange(fm: string | null): void {
     frontmatter = fm;

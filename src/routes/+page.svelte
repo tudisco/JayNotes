@@ -4,9 +4,15 @@
   import Sidebar from "$lib/components/Sidebar.svelte";
   import EditorPane from "$lib/components/EditorPane.svelte";
   import QuickSwitcher from "$lib/components/QuickSwitcher.svelte";
+  import ChatSidebar from "$lib/components/ChatSidebar.svelte";
   import { initVault, newNote, vaultError, vaultPath } from "$lib/stores/vault";
   import { initIndexEvents } from "$lib/stores/indexEvents";
-  import { quickSwitcherOpen, searchFocusNonce, sidebarMode } from "$lib/stores/ui";
+  import {
+    quickSwitcherOpen,
+    searchFocusNonce,
+    sidebarMode,
+    toggleChat,
+  } from "$lib/stores/ui";
 
   onMount(() => {
     initVault();
@@ -23,7 +29,11 @@
     if (get(quickSwitcherOpen)) return;
 
     const key = event.key.toLowerCase();
-    if (key === "p" || key === "o") {
+    if (key === "a" && event.shiftKey) {
+      // Cmd/Ctrl+Shift+A toggles the AI assistant panel.
+      event.preventDefault();
+      toggleChat();
+    } else if (key === "p" || key === "o") {
       event.preventDefault();
       quickSwitcherOpen.set(true);
     } else if (key === "f" && event.shiftKey) {
@@ -45,6 +55,7 @@
 <div class="app-shell">
   <Sidebar />
   <EditorPane />
+  <ChatSidebar />
 </div>
 
 <QuickSwitcher />
