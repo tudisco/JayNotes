@@ -30,8 +30,15 @@ notify-debouncer-full = "0.7.0"
 serde_yaml = "0.9.34"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "http2"] }
 tokio = { version = "1", features = ["sync", "time"] }
+comrak = { version = "0.53", default-features = false }
+typst = "0.15"
+typst-layout = "0.15"
+typst-pdf = "0.15"
+typst-assets = { version = "0.15", features = ["fonts"] }
 
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+base64 = "0.22"
+pdf-extract = "0.9"
 
