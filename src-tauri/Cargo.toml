@@ -28,4 +28,13 @@ trash = "5"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 notify-debouncer-full = "0.7.0"
 serde_yaml = "0.9.34"
+comrak = { version = "0.53", default-features = false }
+typst = "0.15"
+typst-layout = "0.15"
+typst-pdf = "0.15"
+typst-assets = { version = "0.15", features = ["fonts"] }
+
+[dev-dependencies]
+base64 = "0.22"
+pdf-extract = "0.9"
 

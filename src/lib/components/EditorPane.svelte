@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import Editor from "./Editor.svelte";
   import PropertiesBar from "./PropertiesBar.svelte";
   import { renameNote, selected, vaultError } from "$lib/stores/vault";
@@ -63,6 +65,38 @@
     }
   }
 
+  // "Export as PDF…": save the current note to a PDF the user picks, then
+  // reveal it in Finder. Reuses SettingsMenu's transient-status pattern.
+  let exportStatus = $state<"idle" | "exporting" | "done" | "error">("idle");
+
+  async function exportPdf(): Promise<void> {
+    const p = notePath;
+    if (!p || exportStatus === "exporting") return;
+    exportStatus = "exporting";
+    try {
+      const out = await invoke<string>("export_note_pdf", { relPath: p });
+      if (!out) {
+        exportStatus = "idle"; // user cancelled the save dialog
+        return;
+      }
+      exportStatus = "done";
+      try {
+        await revealItemInDir(out);
+      } catch {
+        // Revealing is a nicety; a failure here shouldn't surface as an error.
+      }
+      setTimeout(() => {
+        if (exportStatus === "done") exportStatus = "idle";
+      }, 2500);
+    } catch (e) {
+      exportStatus = "error";
+      vaultError.set(String(e));
+      setTimeout(() => {
+        if (exportStatus === "error") exportStatus = "idle";
+      }, 2500);
+    }
+  }
+
   function onTitleKey(event: KeyboardEvent): void {
     const input = event.currentTarget as HTMLInputElement;
     if (event.key === "Enter") {
@@ -91,6 +125,38 @@
               onkeydown={onTitleKey}
               onblur={commitTitle}
             />
+            <div class="note-actions">
+              {#if exportStatus === "exporting"}
+                <span class="export-status">Exporting…</span>
+              {:else if exportStatus === "done"}
+                <span class="export-status">Exported</span>
+              {/if}
+              <button
+                type="button"
+                class="icon-button"
+                title="Export as PDF…"
+                aria-label="Export as PDF"
+                disabled={exportStatus === "exporting"}
+                onclick={exportPdf}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <path d="M14 2v6h6" />
+                  <path d="M12 18v-6" />
+                  <path d="M9 15l3 3 3-3" />
+                </svg>
+              </button>
+            </div>
           </header>
           <PropertiesBar {frontmatter} onChange={onPropertiesChange} />
         </div>
@@ -135,10 +201,65 @@
   }
 
   .note-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
     max-width: 46rem;
     width: 100%;
     margin: 0 auto;
     padding: 28px 16px 4px;
+  }
+
+  .note-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    padding-top: 4px;
+  }
+
+  .export-status {
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  /* Subtle inline-SVG icon button, revealed like the "+ Add properties"
+     affordance when the title/properties area is hovered or focused. */
+  .icon-button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.15s ease,
+      background-color 0.15s ease,
+      color 0.15s ease;
+  }
+
+  .note-meta:hover .icon-button,
+  .note-meta:focus-within .icon-button,
+  .icon-button:focus-visible {
+    opacity: 1;
+  }
+
+  .icon-button:hover:not(:disabled) {
+    background-color: var(--hover);
+    color: var(--accent);
+  }
+
+  .icon-button:disabled {
+    opacity: 1;
+    color: var(--text-muted);
+    cursor: default;
   }
 
   /* The bare "+ Add properties" affordance stays out of the way until the

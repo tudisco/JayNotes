@@ -1,4 +1,5 @@
 mod index;
+mod pdf;
 mod vault;
 mod watcher;
 
@@ -40,6 +41,7 @@ pub fn run() {
             vault::resolve_note,
             vault::resolve_or_create_note,
             vault::reveal_in_finder,
+            pdf::export_note_pdf,
             index::reindex_vault,
             index::index_status,
             index::search_notes,

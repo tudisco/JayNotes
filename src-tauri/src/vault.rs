@@ -77,7 +77,7 @@ fn save_settings(app: &tauri::AppHandle, settings: &Settings) -> Result<(), Stri
 
 /// Returns the canonicalized vault root, erroring if no vault is configured
 /// or the directory no longer exists.
-fn vault_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn vault_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let settings = load_settings(app)?;
     let raw = settings
         .vault_path
@@ -111,7 +111,7 @@ pub fn saved_vault_root(app: &tauri::AppHandle) -> Option<String> {
 /// Joins `rel` onto `root`, rejecting absolute paths and any path component
 /// that is not a plain name (`..`, drive prefixes, root dirs). `.` components
 /// and an empty string (meaning the root itself) are allowed.
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return Err(format!("Absolute paths are not allowed: {rel}"));
