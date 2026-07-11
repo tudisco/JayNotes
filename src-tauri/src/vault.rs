@@ -536,6 +536,101 @@ fn sanitize_note_name(name: &str) -> String {
     }
 }
 
+/// Image extensions accepted by [`save_attachment`]. Anything else is rejected
+/// so the vault's `attachments/` folder never fills with arbitrary binaries.
+const ALLOWED_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "avif"];
+
+/// Sanitizes a clipboard/drop-supplied image file name into a safe
+/// `(base, extension)` pair. Directory components and leading dots are stripped,
+/// characters illegal in a filename become `-`, and the extension is validated
+/// against [`ALLOWED_IMAGE_EXTS`]. The base falls back to `pasted-image` when
+/// nothing usable remains. Returns an error for missing or disallowed types.
+fn sanitize_attachment_name(raw: &str) -> Result<(String, String), String> {
+    // Keep only the final path segment so `../../evil.png` can't escape.
+    let last = raw.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(raw);
+    // Strip leading dots so `.png` / `.hidden` can't produce a dotfile.
+    let trimmed = last.trim().trim_start_matches('.');
+
+    // Split off the extension (the part after the final `.`).
+    let (base_raw, ext_raw) = match trimmed.rsplit_once('.') {
+        Some((b, e)) if !e.is_empty() => (b, e),
+        _ => {
+            return Err(format!(
+                "Cannot save '{raw}': an image file name like image.png is required"
+            ))
+        }
+    };
+
+    let ext = ext_raw.to_ascii_lowercase();
+    if !ALLOWED_IMAGE_EXTS.contains(&ext.as_str()) {
+        return Err(format!(
+            "Unsupported image type '.{ext}'. Allowed: {}",
+            ALLOWED_IMAGE_EXTS.join(", ")
+        ));
+    }
+
+    // Replace filename-illegal characters in the base with `-`, then trim.
+    let cleaned: String = base_raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || "/\\<>:\"|?*".contains(c) {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let base = cleaned.trim().trim_matches('-').trim();
+    let base = if base.is_empty() {
+        "pasted-image".to_string()
+    } else {
+        base.to_string()
+    };
+    Ok((base, ext))
+}
+
+/// Finds the first free `base.ext` in `dir`, then `base-1.ext`, `base-2.ext`, …
+fn unique_attachment_path(dir: &Path, base: &str, ext: &str) -> Result<PathBuf, String> {
+    let first = dir.join(format!("{base}.{ext}"));
+    if !first.exists() {
+        return Ok(first);
+    }
+    for n in 1..100_000 {
+        let candidate = dir.join(format!("{base}-{n}.{ext}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("Could not find a free attachment name".to_string())
+}
+
+/// Saves image bytes as a real file under `attachments/` in the vault root and
+/// returns its vault-relative path (e.g. `attachments/pasted-image.png`), which
+/// the editor drops into the note as a standard `![](…)` link. The name is
+/// sanitized and uniquified; only common image types are accepted.
+#[tauri::command]
+pub async fn save_attachment(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_name: String,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    let root = vault_root(&app)?;
+    let (base, ext) = sanitize_attachment_name(&file_name)?;
+
+    let dir = root.join("attachments");
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Could not create attachments folder: {e}"))?;
+
+    let path = unique_attachment_path(&dir, &base, &ext)?;
+    let rel = to_rel_string(&root, &path)?;
+    // Register the write so the watcher ignores it. Harmless: the watcher skips
+    // non-.md files anyway, but this keeps the suppression path uniform.
+    register_write(&state.recent_writes, &rel);
+    fs::write(&path, &data).map_err(|e| format!("Could not write attachment '{rel}': {e}"))?;
+    Ok(rel)
+}
+
 /// Reveals a file or folder in the OS file manager (Finder on macOS).
 #[tauri::command]
 pub async fn reveal_in_finder(app: tauri::AppHandle, rel_path: String) -> Result<(), String> {
@@ -681,6 +776,75 @@ mod tests {
         assert_eq!(unique_untitled(&dir).unwrap(), dir.join("Untitled 1.md"));
         fs::write(dir.join("Untitled 1.md"), "").unwrap();
         assert_eq!(unique_untitled(&dir).unwrap(), dir.join("Untitled 2.md"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sanitize_attachment_name_cleans_and_keeps_extension() {
+        // Plain name passes through, extension lowercased.
+        assert_eq!(
+            sanitize_attachment_name("Photo.PNG").unwrap(),
+            ("Photo".to_string(), "png".to_string())
+        );
+        // Directory components are stripped (defense against path escapes).
+        assert_eq!(
+            sanitize_attachment_name("../../secrets/pic.jpg").unwrap(),
+            ("pic".to_string(), "jpg".to_string())
+        );
+        assert_eq!(
+            sanitize_attachment_name("a\\b\\c.gif").unwrap(),
+            ("c".to_string(), "gif".to_string())
+        );
+        // Illegal characters in the base become '-', edges trimmed.
+        assert_eq!(
+            sanitize_attachment_name("my:cool*shot?.webp").unwrap(),
+            ("my-cool-shot".to_string(), "webp".to_string())
+        );
+        // Interior dots in the base are preserved.
+        assert_eq!(
+            sanitize_attachment_name("v1.2.final.jpeg").unwrap(),
+            ("v1.2.final".to_string(), "jpeg".to_string())
+        );
+        // Leading dots are stripped so a dotfile can't be produced.
+        assert_eq!(
+            sanitize_attachment_name(".hidden.png").unwrap(),
+            ("hidden".to_string(), "png".to_string())
+        );
+        // A base that is nothing but illegal characters falls back to default.
+        assert_eq!(
+            sanitize_attachment_name("??.png").unwrap(),
+            ("pasted-image".to_string(), "png".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_attachment_name_rejects_bad_types() {
+        // Disallowed extensions.
+        assert!(sanitize_attachment_name("evil.exe").is_err());
+        assert!(sanitize_attachment_name("doc.pdf").is_err());
+        assert!(sanitize_attachment_name("archive.tar.gz").is_err());
+        // No extension at all.
+        assert!(sanitize_attachment_name("noext").is_err());
+        assert!(sanitize_attachment_name("trailingdot.").is_err());
+    }
+
+    #[test]
+    fn unique_attachment_path_uniquifies_on_collision() {
+        let dir = make_temp_dir("attach");
+        assert_eq!(
+            unique_attachment_path(&dir, "img", "png").unwrap(),
+            dir.join("img.png")
+        );
+        fs::write(dir.join("img.png"), b"x").unwrap();
+        assert_eq!(
+            unique_attachment_path(&dir, "img", "png").unwrap(),
+            dir.join("img-1.png")
+        );
+        fs::write(dir.join("img-1.png"), b"x").unwrap();
+        assert_eq!(
+            unique_attachment_path(&dir, "img", "png").unwrap(),
+            dir.join("img-2.png")
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }

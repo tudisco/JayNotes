@@ -1089,6 +1089,17 @@ pub fn init_for_vault(
     state: &AppState,
     vault_root: &Path,
 ) -> Result<(), String> {
+    // Let the asset protocol serve files from inside this vault so the editor's
+    // `convertFileSrc()` URLs for vault-relative images resolve at runtime. When
+    // the user switches vaults mid-session the scope only grows (old vault stays
+    // allowed until restart); that's acceptable for a local single-user app.
+    if let Err(e) = app.asset_protocol_scope().allow_directory(vault_root, true) {
+        eprintln!(
+            "Could not grant asset-protocol access to {}: {e}",
+            vault_root.display()
+        );
+    }
+
     let db_path = db_path_for(app, vault_root)?;
     let index = Index::open(&db_path, vault_root)?;
     *state.index.lock().unwrap() = Some(index);

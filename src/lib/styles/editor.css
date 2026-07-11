@@ -142,3 +142,14 @@
 :root:not([data-theme="dark"]) .milkdown .milkdown-code-block .cm-gutters {
   color: var(--text-muted);
 }
+
+/* Content images (paste/drag/rendered): never overflow the column, soft
+   corners. Applies to both the inline `<img>` node and Crepe's block image
+   wrapper, in both themes. */
+.milkdown .ProseMirror img,
+.milkdown .milkdown-image-block img,
+.milkdown .milkdown-image-inline img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 3px;
+}

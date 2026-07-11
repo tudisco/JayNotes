@@ -30,8 +30,12 @@
   // Aliased: Svelte reserves the `$` prefix for local identifiers.
   import { $prose as proseComposable } from "@milkdown/kit/utils";
   import { Plugin, PluginKey, type EditorState } from "@milkdown/kit/prose/state";
-  import { Decoration, DecorationSet } from "@milkdown/kit/prose/view";
+  import { Decoration, DecorationSet, type EditorView } from "@milkdown/kit/prose/view";
   import type { Node as ProseNode } from "@milkdown/kit/prose/model";
+  import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+  import { get } from "svelte/store";
+  import { vaultPath, vaultError } from "$lib/stores/vault";
+  import { isRelativeUrl } from "$lib/utils/url";
 
   /** A `[[...]]` run that stays on one line and holds no brackets itself. */
   const WIKILINK_RE = /\[\[[^[\]\n]+?\]\]/g;
@@ -71,16 +75,131 @@
         },
       }),
   );
+
+  // ---------------------------------------------------------------------------
+  // Local image support: paste / drag save to attachments/, relative render
+  //
+  // Crepe's ImageBlock feature only routes its upload *button* through
+  // `onUpload`, and its bundled clipboard handler ignores image files entirely.
+  // So a raw ProseMirror plugin (same `editor.use` path as the wikilink one)
+  // catches image paste/drop, saves the bytes as a real file via the
+  // `save_attachment` command, and inserts a standard inline image node whose
+  // `src` is the vault-relative path — keeping the markdown on disk clean
+  // (`![](attachments/…)`, never an asset URL). `proxyDomURL` (below, in the
+  // ImageBlock config) rewrites that relative path to a loadable asset URL for
+  // DOM display only.
+
+  /** Ensures a clipboard image blob carries a real filename with an extension. */
+  function namedImageFile(file: File): File {
+    if (file.name && file.name.includes(".")) return file;
+    const ext = (file.type.split("/")[1] || "png").toLowerCase();
+    return new File([file], `pasted-image.${ext}`, { type: file.type });
+  }
+
+  /** Collects image files from a clipboard/drag payload (files first, then items). */
+  function extractImageFiles(dt: DataTransfer | null): File[] {
+    if (!dt) return [];
+    const out: File[] = [];
+    for (const f of Array.from(dt.files)) {
+      if (f.type.startsWith("image/")) out.push(f);
+    }
+    if (out.length > 0) return out;
+    // Screenshot paste often exposes the blob only via `items`, not `files`.
+    for (const item of Array.from(dt.items ?? [])) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const f = item.getAsFile();
+        if (f) out.push(namedImageFile(f));
+      }
+    }
+    return out;
+  }
+
+  /** Saves an image File under the vault's `attachments/`; returns its rel path. */
+  async function uploadImage(file: File): Promise<string> {
+    const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+    return invoke<string>("save_attachment", {
+      fileName: file.name || "pasted-image.png",
+      data: bytes,
+    });
+  }
+
+  /**
+   * DOM display resolver for Crepe's ImageBlock. A vault-relative `src` becomes
+   * a `convertFileSrc` asset URL so the webview can load the on-disk file;
+   * absolute/scheme URLs (remote https, data:) pass through untouched. This only
+   * affects rendering — the stored markdown keeps the relative path.
+   */
+  function proxyImageURL(url: string): string {
+    if (!isRelativeUrl(url)) return url;
+    const root = get(vaultPath);
+    if (!root) return url;
+    let rel = url;
+    try {
+      rel = decodeURI(url);
+    } catch {
+      rel = url;
+    }
+    return convertFileSrc(`${root}/${rel}`);
+  }
+
+  /** Saves `file`, then inserts an inline image node (clean `![](rel)` markdown). */
+  async function insertImageFile(
+    view: EditorView,
+    file: File,
+    pos: number | null,
+  ): Promise<void> {
+    let src: string;
+    try {
+      src = await uploadImage(file);
+    } catch (e) {
+      vaultError.set(String(e));
+      return;
+    }
+    const imageType = view.state.schema.nodes.image;
+    if (!imageType) return;
+    const node = imageType.create({ src, alt: "", title: "" });
+    const tr =
+      pos === null
+        ? view.state.tr.replaceSelectionWith(node, false)
+        : view.state.tr.insert(pos, node);
+    view.dispatch(tr);
+  }
+
+  const imageDropPasteKey = new PluginKey("jaynotes-image-drop-paste");
+
+  const imagePastePlugin = proseComposable(
+    () =>
+      new Plugin({
+        key: imageDropPasteKey,
+        props: {
+          handlePaste(view: EditorView, event: ClipboardEvent) {
+            const files = extractImageFiles(event.clipboardData);
+            if (files.length === 0) return false;
+            event.preventDefault();
+            for (const file of files) void insertImageFile(view, file, null);
+            return true;
+          },
+          handleDrop(view: EditorView, event: DragEvent) {
+            const files = extractImageFiles(event.dataTransfer);
+            if (files.length === 0) return false;
+            event.preventDefault();
+            const pos =
+              view.posAtCoords({ left: event.clientX, top: event.clientY })
+                ?.pos ?? null;
+            for (const file of files) void insertImageFile(view, file, pos);
+            return true;
+          },
+        },
+      }),
+  );
 </script>
 
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
   import { Crepe } from "@milkdown/crepe";
   import {
     readNote,
     writeNote,
-    vaultError,
     selected,
     ensureVisible,
   } from "$lib/stores/vault";
@@ -201,6 +320,13 @@
       features: { [Crepe.Feature.TopBar]: false },
       featureConfigs: {
         [Crepe.Feature.Placeholder]: { text: "Start writing…", mode: "block" },
+        // `onUpload` (used by the image upload button) and `proxyDomURL` (used
+        // for DOM rendering) apply to both the block and inline image variants —
+        // Crepe forwards these top-level options to each internally.
+        [Crepe.Feature.ImageBlock]: {
+          onUpload: uploadImage,
+          proxyDomURL: proxyImageURL,
+        },
       },
     });
     instance.on((listener) => {
@@ -213,8 +339,9 @@
       });
     });
 
-    // Register the wikilink decoration plugin before the editor is built.
+    // Register the wikilink decoration + image paste/drop plugins before build.
     instance.editor.use(wikilinkPlugin);
+    instance.editor.use(imagePastePlugin);
 
     await instance.create();
     if (token !== opToken) {

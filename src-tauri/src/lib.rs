@@ -36,6 +36,7 @@ pub fn run() {
             vault::create_folder,
             vault::rename_path,
             vault::trash_path,
+            vault::save_attachment,
             vault::resolve_note,
             vault::resolve_or_create_note,
             vault::reveal_in_finder,
