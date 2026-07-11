@@ -8,8 +8,12 @@
     revealInFinder,
     startRename,
     vaultError,
+    activeCapabilities,
     type TreeNode,
   } from "$lib/stores/vault";
+
+  // Capability-gated: a database vault has no on-disk file to reveal.
+  let canReveal = $derived($activeCapabilities?.revealInFinder ?? true);
 
   const MENU_WIDTH = 200;
   const MENU_MAX_HEIGHT = 220;
@@ -129,15 +133,17 @@
       >
         Delete
       </button>
-      <div class="separator"></div>
-      <button
-        type="button"
-        class="item"
-        role="menuitem"
-        onclick={() => run(revealInFinder)}
-      >
-        Reveal in Finder
-      </button>
+      {#if canReveal}
+        <div class="separator"></div>
+        <button
+          type="button"
+          class="item"
+          role="menuitem"
+          onclick={() => run(revealInFinder)}
+        >
+          Reveal in Finder
+        </button>
+      {/if}
     {/if}
   </div>
 {/if}

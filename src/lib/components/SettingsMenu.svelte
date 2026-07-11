@@ -16,7 +16,13 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { themeMode, cycleTheme, type ThemeMode } from "$lib/stores/theme";
-  import { vaultError, vaultPath } from "$lib/stores/vault";
+  import {
+    vaultError,
+    vaultPath,
+    activeVault,
+    vaultLocked,
+    lockVault,
+  } from "$lib/stores/vault";
   import { vaultSwitcherOpen } from "$lib/stores/ui";
 
   const themeLabels: Record<ThemeMode, string> = {
@@ -53,6 +59,22 @@
   function manageVaults(): void {
     close();
     vaultSwitcherOpen.set(true);
+  }
+
+  // "Lock vault" is offered only for an unlocked encrypted vault.
+  let canLock = $derived(
+    $activeVault !== null && $activeVault.kind !== "plain" && !$vaultLocked,
+  );
+
+  async function onLock(): Promise<void> {
+    const v = $activeVault;
+    close();
+    if (!v) return;
+    try {
+      await lockVault(v.id);
+    } catch (e) {
+      vaultError.set(String(e));
+    }
   }
 
   async function rebuildIndex(): Promise<void> {
@@ -107,6 +129,13 @@
         <span class="menu-icon">⇄</span>
         <span class="menu-label">Manage vaults…</span>
       </button>
+
+      {#if canLock}
+        <button type="button" class="menu-item" role="menuitem" onclick={onLock}>
+          <span class="menu-icon">🔒</span>
+          <span class="menu-label">Lock vault</span>
+        </button>
+      {/if}
 
       <button
         type="button"

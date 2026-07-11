@@ -34,7 +34,7 @@
   import type { Node as ProseNode } from "@milkdown/kit/prose/model";
   import { invoke, convertFileSrc } from "@tauri-apps/api/core";
   import { get } from "svelte/store";
-  import { vaultPath, vaultError } from "$lib/stores/vault";
+  import { vaultPath, vaultError, activeVault } from "$lib/stores/vault";
   import { notifyNoteSaved } from "$lib/stores/indexEvents";
   import { isRelativeUrl } from "$lib/utils/url";
 
@@ -125,21 +125,33 @@
   }
 
   /**
-   * DOM display resolver for Crepe's ImageBlock. A vault-relative `src` becomes
-   * a `convertFileSrc` asset URL so the webview can load the on-disk file;
-   * absolute/scheme URLs (remote https, data:) pass through untouched. This only
-   * affects rendering — the stored markdown keeps the relative path.
+   * DOM display resolver for Crepe's ImageBlock. A vault-relative `src` is
+   * resolved for display only (the stored markdown keeps the relative path);
+   * absolute/scheme URLs (remote https, data:) pass through untouched.
+   *
+   * Plain vaults use a `convertFileSrc` asset URL to the on-disk file. Encrypted
+   * vaults can't expose files to the webview, so the bytes come back as a
+   * `data:` URI from the backend (Crepe's `proxyDomURL` accepts a Promise).
    */
-  function proxyImageURL(url: string): string {
+  async function proxyImageURL(url: string): Promise<string> {
     if (!isRelativeUrl(url)) return url;
-    const root = get(vaultPath);
-    if (!root) return url;
     let rel = url;
     try {
       rel = decodeURI(url);
     } catch {
       rel = url;
     }
+    if (get(activeVault)?.kind !== "plain") {
+      try {
+        return await invoke<string>("read_attachment_data_url", {
+          relPath: rel,
+        });
+      } catch {
+        return url;
+      }
+    }
+    const root = get(vaultPath);
+    if (!root) return url;
     return convertFileSrc(`${root}/${rel}`);
   }
 

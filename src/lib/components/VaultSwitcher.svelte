@@ -17,13 +17,16 @@
     activeVault,
     addVault,
     createVault,
+    createEncryptedVault,
     removeVault,
     renameVault,
     switchVault,
     vaultError,
     vaults,
     activeVaultId,
+    providers,
     type VaultInfo,
+    type ProviderMeta,
   } from "$lib/stores/vault";
   import { vaultSwitcherOpen } from "$lib/stores/ui";
   import { shortenPath } from "$lib/utils/path";
@@ -33,20 +36,33 @@
   let renameValue = $state("");
   let confirmingRemoveId = $state<string | null>(null);
 
-  // "New vault" inline flow: once a parent folder is picked, prompt for a name.
-  let newVaultParent = $state<string | null>(null);
-  let newVaultName = $state("");
+  // "New vault" flow: pick a provider type, then fill its config fields.
+  let newStep = $state<"type" | "config" | null>(null);
+  let newProvider = $state<ProviderMeta | null>(null);
+  // Generic config values keyed by ConfigField.key, plus the remember toggle.
+  let configValues = $state<Record<string, string>>({});
+  let rememberPassword = $state(false);
+  let createError = $state("");
+  let creating = $state(false);
 
   function open(): void {
     vaultSwitcherOpen.set(true);
+  }
+
+  function resetNew(): void {
+    newStep = null;
+    newProvider = null;
+    configValues = {};
+    rememberPassword = false;
+    createError = "";
+    creating = false;
   }
 
   function close(): void {
     vaultSwitcherOpen.set(false);
     renamingId = null;
     confirmingRemoveId = null;
-    newVaultParent = null;
-    newVaultName = "";
+    resetNew();
   }
 
   function toggle(): void {
@@ -103,28 +119,71 @@
     }
   }
 
-  async function onPickNewParent(): Promise<void> {
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const picked = await invoke<string | null>("pick_vault");
-      if (picked) {
-        newVaultParent = picked;
-        newVaultName = "";
-      }
-    } catch (e) {
-      vaultError.set(String(e));
+  // Start the "New vault" flow: skip straight to the config form when only one
+  // provider is compiled in, otherwise show the type picker.
+  function startNewVault(): void {
+    createError = "";
+    if ($providers.length <= 1) {
+      chooseProvider($providers[0] ?? null);
+    } else {
+      newStep = "type";
     }
   }
 
-  async function commitNewVault(): Promise<void> {
-    const parent = newVaultParent;
-    const name = newVaultName.trim();
-    if (!parent || !name) return;
-    close();
+  function chooseProvider(p: ProviderMeta | null): void {
+    if (!p) return;
+    newProvider = p;
+    configValues = {};
+    rememberPassword = false;
+    createError = "";
+    newStep = "config";
+  }
+
+  async function pickFolderInto(key: string): Promise<void> {
     try {
-      await createVault(parent, name);
+      const { invoke } = await import("@tauri-apps/api/core");
+      const picked = await invoke<string | null>("pick_vault");
+      if (picked) configValues = { ...configValues, [key]: picked };
     } catch (e) {
-      vaultError.set(String(e));
+      createError = String(e);
+    }
+  }
+
+  async function submitNewVault(): Promise<void> {
+    const p = newProvider;
+    if (!p || creating) return;
+    // Required-field + password-confirm validation.
+    for (const f of p.configFields) {
+      if (f.required && !(configValues[f.key] ?? "").trim()) {
+        createError = `${f.label} is required`;
+        return;
+      }
+    }
+    if (
+      "password" in configValues &&
+      "confirm" in configValues &&
+      configValues.password !== configValues.confirm
+    ) {
+      createError = "Passwords do not match";
+      return;
+    }
+    creating = true;
+    createError = "";
+    try {
+      if (p.kind === "encrypted-db") {
+        await createEncryptedVault(
+          configValues.location,
+          configValues.name,
+          configValues.password,
+          rememberPassword,
+        );
+      } else {
+        await createVault(configValues.location, configValues.name);
+      }
+      close();
+    } catch (e) {
+      createError = String(e);
+      creating = false;
     }
   }
 
@@ -134,12 +193,19 @@
       renamingId = null;
     } else if (confirmingRemoveId) {
       confirmingRemoveId = null;
-    } else if (newVaultParent !== null) {
-      newVaultParent = null;
+    } else if (newStep === "config") {
+      newStep = $providers.length <= 1 ? null : "type";
+    } else if (newStep === "type") {
+      newStep = null;
     } else {
       close();
     }
   }
+
+  const statusLabel: Record<string, string> = {
+    offline: "offline",
+    unsupported: "unsupported",
+  };
 
   function onWindowPointerDown(event: MouseEvent): void {
     if (!$vaultSwitcherOpen) return;
@@ -213,7 +279,11 @@
             </div>
           </div>
         {:else}
-          <div class="row" class:offline={vault.status === "offline"}>
+          <div
+            class="row"
+            class:offline={vault.status === "offline"}
+            class:unsupported={vault.status === "unsupported"}
+          >
             <button
               type="button"
               class="row-main"
@@ -222,18 +292,28 @@
               disabled={vault.status !== "ok"}
               title={vault.status === "offline"
                 ? "Drive not connected"
-                : vault.path}
+                : vault.status === "unsupported"
+                  ? "This vault type is unsupported in this build"
+                  : vault.path}
               onclick={() => pick(vault)}
             >
-              <span
-                class="dot"
-                class:dot-ok={vault.status === "ok"}
-                class:dot-offline={vault.status === "offline"}
-              ></span>
+              {#if vault.kind !== "plain"}
+                <span class="dot dot-lock" aria-hidden="true">🔒</span>
+              {:else}
+                <span
+                  class="dot"
+                  class:dot-ok={vault.status === "ok"}
+                  class:dot-offline={vault.status === "offline"}
+                ></span>
+              {/if}
               <span class="row-text">
                 <span class="row-name">
                   {vault.name}
-                  {#if vault.status === "offline"}<span class="tag">offline</span>{/if}
+                  {#if statusLabel[vault.status]}
+                    <span class="tag" class:tag-warn={vault.status === "unsupported"}>
+                      {statusLabel[vault.status]}
+                    </span>
+                  {/if}
                 </span>
                 <span class="row-path">{shortenPath(vault.path)}</span>
               </span>
@@ -267,32 +347,74 @@
 
       <div class="separator"></div>
 
-      {#if newVaultParent !== null}
+      {#if newStep === "type"}
         <div class="new-vault">
-          <p class="new-vault-parent" title={newVaultParent}>
-            In {shortenPath(newVaultParent)}
-          </p>
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
-            class="rename-input"
-            autofocus
-            placeholder="New vault name"
-            bind:value={newVaultName}
-            onkeydown={(e) => {
-              if (e.key === "Enter") commitNewVault();
-            }}
-          />
-          <div class="confirm-actions">
-            <button type="button" class="confirm-btn primary" onclick={commitNewVault}>
-              Create
-            </button>
+          <p class="new-vault-heading">Choose a vault type</p>
+          {#each $providers as p (p.kind)}
             <button
               type="button"
-              class="confirm-btn"
-              onclick={() => (newVaultParent = null)}
+              class="type-option"
+              onclick={() => chooseProvider(p)}
             >
-              Cancel
+              <span class="type-icon">{p.kind === "plain" ? "📁" : "🔒"}</span>
+              <span class="type-text">
+                <span class="type-name">{p.displayName}</span>
+                <span class="type-desc">{p.description}</span>
+              </span>
             </button>
+          {/each}
+          <div class="confirm-actions">
+            <button type="button" class="confirm-btn" onclick={resetNew}>Cancel</button>
+          </div>
+        </div>
+      {:else if newStep === "config" && newProvider}
+        <div class="new-vault">
+          <p class="new-vault-heading">New {newProvider.displayName.toLowerCase()}</p>
+          {#each newProvider.configFields as f (f.key)}
+            <label class="field-label" for={`cfg-${f.key}`}>{f.label}</label>
+            {#if f.fieldType === "folder"}
+              <button
+                type="button"
+                class="folder-pick"
+                onclick={() => pickFolderInto(f.key)}
+              >
+                {configValues[f.key]
+                  ? shortenPath(configValues[f.key])
+                  : (f.placeholder ?? "Choose folder…")}
+              </button>
+            {:else}
+              <input
+                id={`cfg-${f.key}`}
+                class="rename-input"
+                type={f.fieldType === "password" ? "password" : "text"}
+                autocomplete="off"
+                placeholder={f.placeholder ?? ""}
+                bind:value={configValues[f.key]}
+                onkeydown={(e) => {
+                  if (e.key === "Enter") submitNewVault();
+                }}
+              />
+            {/if}
+          {/each}
+          {#if newProvider.capabilities.needsUnlock}
+            <label class="remember">
+              <input type="checkbox" bind:checked={rememberPassword} />
+              Remember password
+            </label>
+          {/if}
+          {#if createError}
+            <p class="create-error">{createError}</p>
+          {/if}
+          <div class="confirm-actions">
+            <button
+              type="button"
+              class="confirm-btn primary"
+              disabled={creating}
+              onclick={submitNewVault}
+            >
+              {creating ? "Creating…" : "Create"}
+            </button>
+            <button type="button" class="confirm-btn" onclick={resetNew}>Cancel</button>
           </div>
         </div>
       {:else}
@@ -300,7 +422,7 @@
           <span class="menu-icon">＋</span>
           <span>Add existing folder…</span>
         </button>
-        <button type="button" class="menu-item" role="menuitem" onclick={onPickNewParent}>
+        <button type="button" class="menu-item" role="menuitem" onclick={startNewVault}>
           <span class="menu-icon">✦</span>
           <span>New vault…</span>
         </button>
@@ -420,6 +542,20 @@
     background-color: #d9a441;
   }
 
+  /* The encrypted-vault lock glyph replaces the status dot. */
+  .dot-lock {
+    width: auto;
+    height: auto;
+    background: transparent;
+    border-radius: 0;
+    font-size: 10px;
+    line-height: 1;
+  }
+
+  .row.unsupported .row-main {
+    opacity: 0.55;
+  }
+
   .row-text {
     display: flex;
     flex-direction: column;
@@ -442,6 +578,10 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: #d9a441;
+  }
+
+  .tag-warn {
+    color: var(--text-muted);
   }
 
   .row-path {
@@ -549,13 +689,97 @@
     line-height: 1.4;
   }
 
-  .new-vault-parent {
-    margin: 2px 0 6px;
+  .new-vault-heading {
+    margin: 2px 2px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .type-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px;
+    margin-bottom: 4px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+    font-family: var(--font-ui);
+    cursor: pointer;
+  }
+
+  .type-option:hover {
+    background-color: var(--hover);
+    border-color: var(--accent);
+  }
+
+  .type-icon {
+    flex-shrink: 0;
+    font-size: 16px;
+  }
+
+  .type-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .type-name {
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .type-desc {
     font-size: 11px;
     color: var(--text-muted);
+  }
+
+  .field-label {
+    display: block;
+    margin: 6px 2px 3px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .folder-pick {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px dashed var(--border);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text);
+    font-size: 12px;
+    font-family: var(--font-ui);
+    text-align: left;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    cursor: pointer;
+  }
+
+  .folder-pick:hover {
+    border-color: var(--accent);
+    background-color: var(--hover);
+  }
+
+  .remember {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .create-error {
+    margin: 8px 2px 0;
+    font-size: 12px;
+    color: var(--danger);
   }
 
   .confirm-actions {

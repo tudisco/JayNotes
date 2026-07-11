@@ -28,11 +28,11 @@ export interface ContextMenuState {
 // Multi-vault types (M13)
 // ---------------------------------------------------------------------------
 
-/** Vault kind. `"plain"` is the only kind in M13; M14 adds `"encrypted"`. */
-export type VaultKind = "plain";
+/** Vault kind, mirrored from the Rust `VaultKind` (`kind()` ids). */
+export type VaultKind = "plain" | "encrypted-db";
 
-/** On-disk status of a vault folder, mirrored from the Rust `VaultStatus`. */
-export type VaultStatus = "ok" | "offline" | "missing";
+/** On-disk status of a vault, mirrored from the Rust `VaultStatus`. */
+export type VaultStatus = "ok" | "offline" | "missing" | "unsupported";
 
 export interface VaultInfo {
   id: string;
@@ -47,6 +47,32 @@ export interface VaultList {
   vaults: VaultInfo[];
   activeId: string | null;
   removed: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Provider metadata (M14) — drives the vault-type picker + config forms
+// ---------------------------------------------------------------------------
+
+export interface ConfigField {
+  key: string;
+  label: string;
+  fieldType: "folder" | "text" | "password" | "url";
+  required: boolean;
+  placeholder?: string;
+}
+
+export interface Capabilities {
+  revealInFinder: boolean;
+  needsUnlock: boolean;
+  folderBacked: boolean;
+}
+
+export interface ProviderMeta {
+  kind: VaultKind;
+  displayName: string;
+  description: string;
+  configFields: ConfigField[];
+  capabilities: Capabilities;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +133,18 @@ export const activeVault = derived(
     $vaults.find((v) => v.id === $activeVaultId) ?? null,
 );
 
+/** Compiled vault providers (from `list_providers`), for the type picker. */
+export const providers = writable<ProviderMeta[]>([]);
+
+/**
+ * True when the active vault is an encrypted vault that is present but not yet
+ * unlocked. The main pane shows the unlock prompt instead of the tree/editor.
+ */
+export const vaultLocked = writable(false);
+
+/** Capabilities of the currently open vault handle (drives capability UI). */
+export const activeCapabilities = writable<Capabilities | null>(null);
+
 function currentActiveVault(): VaultInfo | null {
   const id = get(activeVaultId);
   return get(vaults).find((v) => v.id === id) ?? null;
@@ -116,24 +154,88 @@ function currentActiveVault(): VaultInfo | null {
 // Vault lifecycle
 // ---------------------------------------------------------------------------
 
-/** Called once on app start: loads the vault list and opens the active one. */
+/** Called once on app start: loads providers + the vault list, opens the active one. */
 export async function initVault(): Promise<void> {
   try {
+    await loadProviders();
     await loadVaults();
-    const active = currentActiveVault();
-    if (active && active.status === "ok") {
-      vaultPath.set(active.path);
-      activeVaultOffline.set(false);
-      await refreshTree();
-    } else {
-      vaultPath.set(null);
-      fileTree.set(null);
-      activeVaultOffline.set(!!active && active.status === "offline");
-    }
+    await activateActive();
   } catch (e) {
     vaultError.set(String(e));
   } finally {
     vaultLoading.set(false);
+  }
+}
+
+/** Loads the compiled provider metadata for the vault-type picker. */
+export async function loadProviders(): Promise<void> {
+  try {
+    providers.set(await invoke<ProviderMeta[]>("list_providers"));
+  } catch {
+    providers.set([]);
+  }
+}
+
+/**
+ * Brings the active vault's UI into the right state after any list/switch:
+ * scans a ready plain/unlocked vault, shows the offline retry state, or shows
+ * the unlock prompt for a locked encrypted vault (trying a remembered key
+ * silently first). Central so switch/init/remove all behave identically.
+ */
+async function activateActive(): Promise<void> {
+  const active = currentActiveVault();
+  selected.set(null);
+  expandedDirs.set(new Set());
+  activeCapabilities.set(null);
+
+  if (!active || active.status === "missing") {
+    vaultPath.set(null);
+    fileTree.set(null);
+    vaultLocked.set(false);
+    activeVaultOffline.set(false);
+    return;
+  }
+  if (active.status === "offline" || active.status === "unsupported") {
+    vaultPath.set(null);
+    fileTree.set(null);
+    vaultLocked.set(false);
+    activeVaultOffline.set(active.status === "offline");
+    return;
+  }
+
+  activeVaultOffline.set(false);
+
+  // Encrypted vaults may need unlocking; try a remembered key silently.
+  if (active.kind !== "plain") {
+    let locked = await invoke<boolean>("vault_needs_unlock", { id: active.id });
+    if (locked) {
+      const opened = await invoke<boolean>("unlock_remembered", {
+        id: active.id,
+      });
+      locked = !opened;
+    }
+    if (locked) {
+      vaultPath.set(active.path);
+      fileTree.set(null);
+      vaultLocked.set(true);
+      return;
+    }
+  }
+
+  vaultLocked.set(false);
+  vaultPath.set(active.path);
+  await loadCapabilities();
+  await refreshTree();
+}
+
+/** Refreshes the active vault handle's capability flags. */
+async function loadCapabilities(): Promise<void> {
+  try {
+    activeCapabilities.set(
+      await invoke<Capabilities | null>("active_capabilities"),
+    );
+  } catch {
+    activeCapabilities.set(null);
   }
 }
 
@@ -163,14 +265,50 @@ export function dismissRemovedNotice(): void {
  * target vault is unreachable.
  */
 export async function switchVault(id: string): Promise<void> {
-  const path = await invoke<string>("switch_vault", { id });
-  vaultPath.set(path);
-  activeVaultOffline.set(false);
-  selected.set(null);
-  expandedDirs.set(new Set());
   fileTree.set(null);
+  await invoke<string>("switch_vault", { id });
   await loadVaults();
-  await refreshTree();
+  await activateActive();
+}
+
+/**
+ * Creates a new encrypted-db vault (a `<name>.jaynotes` container at `location`,
+ * password-locked) and opens it. Returns the new vault id.
+ */
+export async function createEncryptedVault(
+  location: string,
+  name: string,
+  password: string,
+  remember: boolean,
+): Promise<string> {
+  const vault = await invoke<VaultInfo>("create_encrypted_vault", {
+    location,
+    name,
+    password,
+    remember,
+  });
+  await loadVaults();
+  await activateActive();
+  return vault.id;
+}
+
+/** Unlocks the given encrypted vault with a password, then opens it. */
+export async function unlockVault(
+  id: string,
+  password: string,
+  remember: boolean,
+): Promise<void> {
+  await invoke("unlock_vault", { id, password, remember });
+  await activateActive();
+}
+
+/** Locks the active encrypted vault (clears the in-memory key). */
+export async function lockVault(id: string): Promise<void> {
+  await invoke("lock_vault", { id });
+  vaultLocked.set(true);
+  fileTree.set(null);
+  selected.set(null);
+  activeCapabilities.set(null);
 }
 
 /**
@@ -208,18 +346,7 @@ export async function removeVault(id: string): Promise<void> {
   await invoke<string | null>("remove_vault", { id });
   await loadVaults();
   if (wasActive) {
-    const active = currentActiveVault();
-    selected.set(null);
-    expandedDirs.set(new Set());
-    if (active && active.status === "ok") {
-      vaultPath.set(active.path);
-      activeVaultOffline.set(false);
-      await refreshTree();
-    } else {
-      vaultPath.set(null);
-      fileTree.set(null);
-      activeVaultOffline.set(!!active && active.status === "offline");
-    }
+    await activateActive();
   }
 }
 

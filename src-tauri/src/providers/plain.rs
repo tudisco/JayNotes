@@ -25,13 +25,16 @@ impl VaultProvider for PlainProvider {
             kind: "plain".into(),
             display_name: "Plain folder".into(),
             description: "A folder of portable Markdown files on disk.".into(),
-            config_fields: vec![field(
-                "location",
-                "Folder",
-                "folder",
-                true,
-                "Pick a folder for your notes",
-            )],
+            config_fields: vec![
+                field(
+                    "location",
+                    "Parent folder",
+                    "folder",
+                    true,
+                    "Where to create the vault folder",
+                ),
+                field("name", "Vault name", "text", true, "My Notes"),
+            ],
             capabilities: Self::CAPS,
         }
     }

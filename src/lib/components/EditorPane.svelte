@@ -4,7 +4,14 @@
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import Editor from "./Editor.svelte";
   import PropertiesBar from "./PropertiesBar.svelte";
-  import { renameNote, selected, vaultError } from "$lib/stores/vault";
+  import {
+    renameNote,
+    selected,
+    vaultError,
+    vaultLocked,
+    activeVault,
+    unlockVault,
+  } from "$lib/stores/vault";
   import { vaultChanged } from "$lib/stores/indexEvents";
   import {
     editorReloadNonce,
@@ -118,6 +125,35 @@
     }
   }
 
+  // ---- encrypted-vault unlock prompt (shown in the main pane) ----
+  let unlockPassword = $state("");
+  let unlockRemember = $state(false);
+  let unlockError = $state("");
+  let unlocking = $state(false);
+
+  // Clear the prompt whenever the active (locked) vault changes.
+  $effect(() => {
+    void $activeVault?.id;
+    unlockPassword = "";
+    unlockError = "";
+  });
+
+  async function submitUnlock(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    const v = $activeVault;
+    if (!v || unlocking || !unlockPassword) return;
+    unlocking = true;
+    unlockError = "";
+    try {
+      await unlockVault(v.id, unlockPassword, unlockRemember);
+      unlockPassword = "";
+    } catch (e) {
+      unlockError = String(e);
+    } finally {
+      unlocking = false;
+    }
+  }
+
   function onTitleKey(event: KeyboardEvent): void {
     const input = event.currentTarget as HTMLInputElement;
     if (event.key === "Enter") {
@@ -183,6 +219,37 @@
         </div>
         <Editor bind:this={editor} path={notePath} bind:frontmatter />
       {/key}
+    </div>
+  {:else if $vaultLocked && $activeVault}
+    <div class="unlock-pane">
+      <div class="lock-icon" aria-hidden="true">🔒</div>
+      <p class="unlock-title">{$activeVault.name} is locked</p>
+      <p class="unlock-hint">Enter the password to open this encrypted vault.</p>
+      <form class="unlock-form" onsubmit={submitUnlock}>
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          class="unlock-input"
+          type="password"
+          autofocus
+          autocomplete="off"
+          placeholder="Password"
+          bind:value={unlockPassword}
+        />
+        <label class="unlock-remember">
+          <input type="checkbox" bind:checked={unlockRemember} />
+          Remember password
+        </label>
+        {#if unlockError}
+          <p class="unlock-error">{unlockError}</p>
+        {/if}
+        <button
+          class="unlock-button"
+          type="submit"
+          disabled={unlocking || !unlockPassword}
+        >
+          {unlocking ? "Unlocking…" : "Unlock"}
+        </button>
+      </form>
     </div>
   {:else}
     <div class="empty-state">
@@ -340,5 +407,93 @@
     margin: 0;
     font-size: 13px;
     color: var(--text-muted);
+  }
+
+  .unlock-pane {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 24px;
+    max-width: 22rem;
+  }
+
+  .lock-icon {
+    font-size: 34px;
+    line-height: 1;
+    margin-bottom: 14px;
+    opacity: 0.7;
+  }
+
+  .unlock-title {
+    margin: 0 0 6px;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .unlock-hint {
+    margin: 0 0 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .unlock-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 100%;
+  }
+
+  .unlock-input {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background-color: var(--bg-input, var(--bg-panel));
+    color: var(--text);
+    font-size: 14px;
+    font-family: var(--font-ui);
+    box-sizing: border-box;
+  }
+
+  .unlock-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .unlock-remember {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .unlock-error {
+    margin: 0;
+    font-size: 12px;
+    color: var(--danger);
+  }
+
+  .unlock-button {
+    padding: 8px 10px;
+    border: none;
+    border-radius: 6px;
+    background-color: var(--accent);
+    color: var(--accent-contrast);
+    font-size: 14px;
+    font-family: var(--font-ui);
+    cursor: pointer;
+  }
+
+  .unlock-button:hover:not(:disabled) {
+    background-color: var(--accent-hover);
+  }
+
+  .unlock-button:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 </style>
