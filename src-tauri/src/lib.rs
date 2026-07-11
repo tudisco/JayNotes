@@ -36,6 +36,8 @@ pub fn run() {
             vault::create_folder,
             vault::rename_path,
             vault::trash_path,
+            vault::resolve_note,
+            vault::resolve_or_create_note,
             vault::reveal_in_finder,
             index::reindex_vault,
             index::index_status,

@@ -16,10 +16,74 @@
   `joinFrontmatter(frontmatter, body)` on the same path the autosave uses — so
   neither side can clobber the other's changes.
 -->
+<script lang="ts" module>
+  // ---------------------------------------------------------------------------
+  // Wikilink decoration plugin (module-scoped: one definition, reused per note)
+  //
+  // Milkdown Crepe has no wikilink parser, so `[[Note Name]]` stays as literal
+  // paragraph text. A raw ProseMirror plugin (registered through Crepe's
+  // `editor.use`) scans the doc and wraps every `[[...]]` run in an inline
+  // `.jaynotes-wikilink` decoration so it reads as an accent-colored link. A
+  // Cmd/Ctrl+Click handler on the host then reads the span's text and navigates
+  // (see `onEditorClick`). This is the most robust option Crepe allows without
+  // forking its markdown parser, and Cmd+Click is the Obsidian-style trigger.
+  // Aliased: Svelte reserves the `$` prefix for local identifiers.
+  import { $prose as proseComposable } from "@milkdown/kit/utils";
+  import { Plugin, PluginKey, type EditorState } from "@milkdown/kit/prose/state";
+  import { Decoration, DecorationSet } from "@milkdown/kit/prose/view";
+  import type { Node as ProseNode } from "@milkdown/kit/prose/model";
+
+  /** A `[[...]]` run that stays on one line and holds no brackets itself. */
+  const WIKILINK_RE = /\[\[[^[\]\n]+?\]\]/g;
+  const wikilinkKey = new PluginKey<DecorationSet>("jaynotes-wikilink");
+
+  function buildWikilinkDecorations(doc: ProseNode): DecorationSet {
+    const decorations: Decoration[] = [];
+    doc.descendants((node: ProseNode, pos: number) => {
+      if (!node.isText || typeof node.text !== "string") return;
+      WIKILINK_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = WIKILINK_RE.exec(node.text)) !== null) {
+        const from = pos + m.index;
+        decorations.push(
+          Decoration.inline(from, from + m[0].length, {
+            class: "jaynotes-wikilink",
+          }),
+        );
+      }
+    });
+    return DecorationSet.create(doc, decorations);
+  }
+
+  const wikilinkPlugin = proseComposable(
+    () =>
+      new Plugin<DecorationSet>({
+        key: wikilinkKey,
+        state: {
+          init: (_config, state) => buildWikilinkDecorations(state.doc),
+          apply: (tr, prev) =>
+            tr.docChanged ? buildWikilinkDecorations(tr.doc) : prev,
+        },
+        props: {
+          decorations(state: EditorState) {
+            return wikilinkKey.getState(state);
+          },
+        },
+      }),
+  );
+</script>
+
 <script lang="ts">
   import { onDestroy } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import { Crepe } from "@milkdown/crepe";
-  import { readNote, writeNote, vaultError } from "$lib/stores/vault";
+  import {
+    readNote,
+    writeNote,
+    vaultError,
+    selected,
+    ensureVisible,
+  } from "$lib/stores/vault";
   import { joinFrontmatter, splitFrontmatter } from "$lib/utils/frontmatter";
 
   let {
@@ -149,6 +213,9 @@
       });
     });
 
+    // Register the wikilink decoration plugin before the editor is built.
+    instance.editor.use(wikilinkPlugin);
+
     await instance.create();
     if (token !== opToken) {
       await instance.destroy();
@@ -158,6 +225,39 @@
     lastSavedBody = instance.getMarkdown();
     loaded = true;
     status = "idle";
+  }
+
+  /**
+   * Navigate a `[[wikilink]]`: resolve `name` to an existing note (or create
+   * one in the vault root on a miss), then open it. Flushes the current note
+   * first so its edits are never lost on the switch.
+   */
+  async function openWikilink(name: string): Promise<void> {
+    try {
+      let path = await invoke<string | null>("resolve_note", { name });
+      if (!path) {
+        path = await invoke<string>("resolve_or_create_note", { name });
+      }
+      await flush();
+      ensureVisible(path);
+      selected.set({ path, isDir: false });
+    } catch (e) {
+      vaultError.set(String(e));
+    }
+  }
+
+  /** Cmd/Ctrl+Click on a `[[...]]` decoration span opens the linked note. */
+  function onEditorClick(event: MouseEvent): void {
+    if (!(event.metaKey || event.ctrlKey)) return;
+    const target = event.target as HTMLElement | null;
+    const span = target?.closest?.(".jaynotes-wikilink") as HTMLElement | null;
+    if (!span) return;
+    const match = (span.textContent ?? "").match(/\[\[([^[\]\n]+?)\]\]/);
+    if (!match) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const name = match[1].split("|")[0].trim();
+    if (name) void openWikilink(name);
   }
 
   async function switchTo(p: string): Promise<void> {
@@ -198,7 +298,8 @@
   {#if loadError}
     <p class="load-error" role="alert">{loadError}</p>
   {/if}
-  <div class="editor-host" bind:this={host}></div>
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div class="editor-host" bind:this={host} onclick={onEditorClick}></div>
   <span class="save-status" class:visible={status !== "idle"} aria-live="polite">
     {status === "saving" ? "Saving…" : status === "saved" ? "Saved" : ""}
   </span>

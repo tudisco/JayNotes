@@ -464,6 +464,78 @@ pub async fn trash_path(
     Ok(())
 }
 
+/// Resolves a `[[wikilink]]` target `name` to an existing note's relative path
+/// via the search index, or `None` if nothing matches. See `Index::resolve`.
+#[tauri::command]
+pub async fn resolve_note(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<Option<String>, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("No vault is indexed")?;
+    index.resolve(&name)
+}
+
+/// Resolves a `[[wikilink]]` target to an existing note, or creates an empty
+/// `<name>.md` in the vault root when nothing matches. The name is sanitized
+/// into a safe single filename. Returns the resolved/created relative path.
+#[tauri::command]
+pub async fn resolve_or_create_note(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<String, String> {
+    // Try the index first; drop the lock before any filesystem work.
+    {
+        let guard = state.index.lock().unwrap();
+        if let Some(idx) = guard.as_ref() {
+            if let Some(path) = idx.resolve(&name)? {
+                return Ok(path);
+            }
+        }
+    }
+
+    let root = vault_root(&app)?;
+    let base = sanitize_note_name(&name);
+    let rel = format!("{base}.md");
+    let path = safe_join(&root, &rel)?;
+    // If a same-named file exists but wasn't indexed yet, just open it.
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Could not create parent folders: {e}"))?;
+        }
+        register_write(&state.recent_writes, &rel);
+        fs::write(&path, "").map_err(|e| format!("Could not create note: {e}"))?;
+        index_upsert(&state, &rel, "");
+    }
+    Ok(rel)
+}
+
+/// Turns an arbitrary wikilink target into a safe single filename: any path
+/// separators or characters illegal in a filename become spaces, a trailing
+/// `.md` is dropped, and the result is trimmed. Empties fall back to
+/// "Untitled".
+fn sanitize_note_name(name: &str) -> String {
+    let base = crate::index::strip_md_suffix(name.trim());
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() || "<>:\"|?*".contains(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        "Untitled".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Reveals a file or folder in the OS file manager (Finder on macOS).
 #[tauri::command]
 pub async fn reveal_in_finder(app: tauri::AppHandle, rel_path: String) -> Result<(), String> {
@@ -586,6 +658,19 @@ mod tests {
         assert!(!nested.children[0].is_dir);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sanitize_note_name_strips_separators_and_extension() {
+        assert_eq!(sanitize_note_name("Note One"), "Note One");
+        // Trailing .md dropped.
+        assert_eq!(sanitize_note_name("Note One.md"), "Note One");
+        // Path separators and illegal chars become spaces, then trimmed/collapsed at edges.
+        assert_eq!(sanitize_note_name("folder/Note"), "folder Note");
+        assert_eq!(sanitize_note_name("a:b*c?"), "a b c");
+        // Empty / whitespace falls back to Untitled.
+        assert_eq!(sanitize_note_name("   "), "Untitled");
+        assert_eq!(sanitize_note_name("/"), "Untitled");
     }
 
     #[test]

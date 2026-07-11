@@ -73,6 +73,22 @@
   text-decoration-color: color-mix(in srgb, var(--accent) 50%, transparent);
 }
 
+/* Wikilinks: `[[Note Name]]` spans decorated by our ProseMirror plugin.
+   Reads as an accent link; Cmd/Ctrl+Click navigates (see Editor.svelte). */
+.milkdown .ProseMirror .jaynotes-wikilink {
+  color: var(--accent);
+  border-radius: 3px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  text-underline-offset: 2px;
+}
+
+.milkdown .ProseMirror .jaynotes-wikilink:hover {
+  background-color: color-mix(in srgb, var(--accent) 12%, transparent);
+  text-decoration-color: var(--accent);
+}
+
 /* Inline code */
 .milkdown .ProseMirror code:not(pre code) {
   padding: 0.1em 0.35em;

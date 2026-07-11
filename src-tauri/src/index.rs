@@ -407,6 +407,13 @@ fn build_match(terms: &[String]) -> Option<String> {
     Some(parts.join(" "))
 }
 
+/// Drops a trailing `.md`/`.MD` extension from a string, if present.
+pub(crate) fn strip_md_suffix(s: &str) -> &str {
+    s.strip_suffix(".md")
+        .or_else(|| s.strip_suffix(".MD"))
+        .unwrap_or(s)
+}
+
 /// Title from a vault-relative path: the file stem (name without `.md`).
 fn title_of(rel: &str) -> String {
     let name = rel.rsplit('/').next().unwrap_or(rel);
@@ -963,6 +970,49 @@ impl Index {
             });
         }
         Ok(hits)
+    }
+
+    /// Resolves a wikilink target `name` to a vault-relative note path.
+    ///
+    /// `name` is a `[[wikilink]]` inner (either `Note Name` or
+    /// `folder/Note Name`, with any `.md` suffix ignored). Matching is by
+    /// **title** — the filename without `.md` — case-insensitively, anywhere in
+    /// the vault. Among equal-title candidates the winner is chosen by:
+    ///   1. folder match: a path equal to (or ending with `/`) the full
+    ///      `name`, so `folder/Note` prefers the note actually in `folder/`;
+    ///   2. shallower path (fewer `/` segments);
+    ///   3. lexicographic path, purely for determinism.
+    /// Returns `None` when no title matches.
+    pub fn resolve(&self, name: &str) -> Result<Option<String>, String> {
+        let cleaned = strip_md_suffix(name.trim());
+        if cleaned.is_empty() {
+            return Ok(None);
+        }
+        // The bare title to match is the final path segment of the target.
+        let title = cleaned.rsplit('/').next().unwrap_or(cleaned);
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM notes WHERE title = ?1 COLLATE NOCASE")
+            .map_err(|e| format!("Could not prepare resolve: {e}"))?;
+        let mut paths: Vec<String> = stmt
+            .query_map(params![title], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("Could not run resolve: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Suffix (with .md) that a folder-qualified target should end with.
+        let want = format!("{}.md", cleaned.to_lowercase());
+        paths.sort_by(|a, b| {
+            let rank = |p: &str| -> (bool, usize, String) {
+                let low = p.to_lowercase();
+                let folder_hit = low == want || low.ends_with(&format!("/{want}"));
+                // `false` sorts before `true`, so negate to put hits first.
+                (!folder_hit, p.matches('/').count(), low)
+            };
+            rank(a).cmp(&rank(b))
+        });
+        Ok(paths.into_iter().next())
     }
 
     /// All notes as `{ path, title, mtime }`, newest first — powers the quick
@@ -1538,6 +1588,70 @@ Duplicate #alpha stays once.";
         index.index_file("a.md", "# A\nBody.").unwrap();
         assert!(index.search("   ", 50).unwrap().is_empty());
         assert!(index.search("", 50).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- wikilink resolution ----
+
+    #[test]
+    fn resolve_exact_and_case_insensitive_match() {
+        let root = make_temp_dir("resolve-exact");
+        let index = mem_index(&root);
+        index.upsert("Note One.md", "# One", 100, 5).unwrap();
+        index.upsert("sub/Other.md", "# Other", 100, 5).unwrap();
+
+        assert_eq!(index.resolve("Note One").unwrap().as_deref(), Some("Note One.md"));
+        // Case-insensitive on the title.
+        assert_eq!(index.resolve("note one").unwrap().as_deref(), Some("Note One.md"));
+        // A trailing `.md` in the target is ignored.
+        assert_eq!(index.resolve("Note One.md").unwrap().as_deref(), Some("Note One.md"));
+        // Nested note matched by its bare title.
+        assert_eq!(index.resolve("Other").unwrap().as_deref(), Some("sub/Other.md"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_prefers_shallower_path_on_ties() {
+        let root = make_temp_dir("resolve-shallow");
+        let index = mem_index(&root);
+        // Three notes share the title "Topic"; the root one is shallowest.
+        index.upsert("a/b/Topic.md", "# deep", 100, 5).unwrap();
+        index.upsert("a/Topic.md", "# mid", 100, 5).unwrap();
+        index.upsert("Topic.md", "# root", 100, 5).unwrap();
+
+        assert_eq!(index.resolve("Topic").unwrap().as_deref(), Some("Topic.md"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_folder_qualified_prefers_matching_folder() {
+        let root = make_temp_dir("resolve-folder");
+        let index = mem_index(&root);
+        index.upsert("Topic.md", "# root", 100, 5).unwrap();
+        index.upsert("work/Topic.md", "# work", 100, 5).unwrap();
+
+        // A folder-qualified target picks the note actually in that folder,
+        // even though the root note is shallower.
+        assert_eq!(
+            index.resolve("work/Topic").unwrap().as_deref(),
+            Some("work/Topic.md")
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_miss_returns_none() {
+        let root = make_temp_dir("resolve-miss");
+        let index = mem_index(&root);
+        index.upsert("Exists.md", "# e", 100, 5).unwrap();
+
+        assert!(index.resolve("Nope").unwrap().is_none());
+        assert!(index.resolve("").unwrap().is_none());
+        assert!(index.resolve("   ").unwrap().is_none());
 
         std::fs::remove_dir_all(&root).ok();
     }
