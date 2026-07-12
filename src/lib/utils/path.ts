@@ -36,3 +36,36 @@ export function shortenPath(path: string, maxLen = 40): string {
   }
   return `…/${last}`;
 }
+
+/** Minimal structural shape of a vault tree node (kept store-independent). */
+export interface FolderNode {
+  name: string;
+  path: string;
+  isDir: boolean;
+  children: FolderNode[];
+}
+
+/**
+ * Collects every folder path in the tree, depth-first with each level sorted
+ * alphabetically (case-insensitive), a parent always listed before its
+ * children. Files are ignored; the root itself (path "") is not included — the
+ * caller prepends its own "(vault root)" entry. Paths are the relative,
+ * slash-separated form (e.g. "Projects/Duke"), suitable both as a label and as
+ * a move destination.
+ */
+export function collectFolderPaths(root: FolderNode | null): string[] {
+  const out: string[] = [];
+  const walk = (node: FolderNode): void => {
+    const dirs = node.children
+      .filter((c) => c.isDir)
+      .sort((a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+      );
+    for (const dir of dirs) {
+      out.push(dir.path);
+      walk(dir);
+    }
+  };
+  if (root) walk(root);
+  return out;
+}

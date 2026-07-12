@@ -6,14 +6,17 @@
   import PropertiesBar from "./PropertiesBar.svelte";
   import {
     renameNote,
+    moveNote,
     deleteToTrash,
     selected,
+    fileTree,
     vaultError,
     vaultLocked,
     activeVault,
     unlockVault,
     providers,
   } from "$lib/stores/vault";
+  import { collectFolderPaths } from "$lib/utils/path";
   import { vaultChanged } from "$lib/stores/indexEvents";
   import {
     editorReloadNonce,
@@ -133,11 +136,111 @@
   // and refreshes the tree; errors surface via the usual vaultError path.
   let confirmingTrash = $state(false);
 
-  // Reset the confirm step whenever the open note changes.
+  // "Move to folder…": a small folder-picker popover anchored under the move
+  // button. Lists "(vault root)" plus every folder in the vault; picking one
+  // moves the open note there (filename kept) via the store's move helper.
+  let pickingMove = $state(false);
+  let moveFilter = $state("");
+  let moveActiveIndex = $state(0);
+
+  function parentDir(path: string): string {
+    const i = path.lastIndexOf("/");
+    return i === -1 ? "" : path.slice(0, i);
+  }
+
+  interface MoveOption {
+    path: string; // "" = vault root
+    label: string; // "(vault root)" or a slash-separated folder path
+    depth: number; // indentation level
+    disabled: boolean; // the note's current folder
+  }
+
+  // The folder the open note currently lives in — marked/disabled in the list.
+  let currentFolder = $derived(notePath ? parentDir(notePath) : "");
+
+  // All destinations: root first, then every folder (filtered when searching).
+  let moveOptions = $derived.by<MoveOption[]>(() => {
+    const folders = collectFolderPaths($fileTree);
+    const q = moveFilter.trim().toLowerCase();
+    const matched = q
+      ? folders.filter((p) => p.toLowerCase().includes(q))
+      : folders;
+    const opts: MoveOption[] = [
+      {
+        path: "",
+        label: "(vault root)",
+        depth: 0,
+        disabled: currentFolder === "",
+      },
+    ];
+    for (const p of matched) {
+      opts.push({
+        path: p,
+        label: p,
+        depth: p.split("/").length,
+        disabled: p === currentFolder,
+      });
+    }
+    return opts;
+  });
+
+  // Show a filter box only once the vault has enough folders to warrant it.
+  let showMoveFilter = $derived(collectFolderPaths($fileTree).length > 10);
+
+  // Keep the highlighted row in range as the filtered list shrinks/grows.
+  $effect(() => {
+    const n = moveOptions.length;
+    if (moveActiveIndex > n - 1) moveActiveIndex = Math.max(0, n - 1);
+  });
+
+  function openMovePicker(): void {
+    confirmingTrash = false; // one popover at a time
+    moveFilter = "";
+    moveActiveIndex = 0;
+    pickingMove = true;
+  }
+
+  function closeMovePicker(): void {
+    pickingMove = false;
+  }
+
+  // Reset both popovers whenever the open note changes.
   $effect(() => {
     void notePath;
     confirmingTrash = false;
+    pickingMove = false;
   });
+
+  async function moveTo(dest: string): Promise<void> {
+    const p = notePath;
+    pickingMove = false;
+    if (!p) return;
+    try {
+      // Flush pending edits BEFORE the rename so a debounced autosave can't
+      // race the move and write to the note's old path after it has moved.
+      await editor?.flush();
+      await moveNote(p, dest);
+    } catch (e) {
+      // Collision (a note with that name already exists in the destination) or
+      // any IO error: surface it and leave the note where it was.
+      vaultError.set(String(e));
+    }
+  }
+
+  function onMoveKeydown(event: KeyboardEvent): void {
+    if (!pickingMove) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveActiveIndex = Math.min(moveActiveIndex + 1, moveOptions.length - 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveActiveIndex = Math.max(moveActiveIndex - 1, 0);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const opt = moveOptions[moveActiveIndex];
+      if (opt && !opt.disabled) void moveTo(opt.path);
+    }
+  }
 
   async function trashNote(): Promise<void> {
     const p = notePath;
@@ -208,6 +311,13 @@
     if (event.key === "Escape" && confirmingTrash) {
       confirmingTrash = false;
     }
+    if (pickingMove) {
+      if (event.key === "Escape") {
+        closeMovePicker();
+      } else {
+        onMoveKeydown(event);
+      }
+    }
   }
 
   function onTitleKey(event: KeyboardEvent): void {
@@ -271,6 +381,81 @@
                   <path d="M9 15l3 3 3-3" />
                 </svg>
               </button>
+              <div class="move-wrap">
+                <button
+                  type="button"
+                  class="icon-button"
+                  title="Move to folder…"
+                  aria-label="Move to folder"
+                  aria-haspopup="menu"
+                  aria-expanded={pickingMove}
+                  onclick={() => (pickingMove ? closeMovePicker() : openMovePicker())}
+                >
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v3" />
+                    <path d="M14 17h7" />
+                    <path d="M18 14l3 3-3 3" />
+                  </svg>
+                </button>
+                {#if pickingMove}
+                  <!-- Click-away backdrop + Escape both close the picker. -->
+                  <button
+                    type="button"
+                    class="popover-backdrop"
+                    aria-label="Cancel move to folder"
+                    onclick={closeMovePicker}
+                  ></button>
+                  <div class="move-picker" role="menu" aria-label="Move to folder">
+                    {#if showMoveFilter}
+                      <!-- svelte-ignore a11y_autofocus -->
+                      <input
+                        class="move-filter"
+                        type="text"
+                        placeholder="Filter folders…"
+                        autocomplete="off"
+                        spellcheck="false"
+                        autofocus
+                        bind:value={moveFilter}
+                        oninput={() => (moveActiveIndex = 0)}
+                      />
+                    {/if}
+                    <ul class="move-list">
+                      {#each moveOptions as opt, i (opt.path)}
+                        <li>
+                          <button
+                            type="button"
+                            class="move-item"
+                            class:active={i === moveActiveIndex}
+                            class:current={opt.disabled}
+                            role="menuitem"
+                            disabled={opt.disabled}
+                            style:padding-left="{8 + opt.depth * 12}px"
+                            onmouseenter={() => (moveActiveIndex = i)}
+                            onclick={() => moveTo(opt.path)}
+                          >
+                            <span class="move-item-label">{opt.label}</span>
+                            {#if opt.disabled}
+                              <span class="move-item-hint">current</span>
+                            {/if}
+                          </button>
+                        </li>
+                      {:else}
+                        <li class="move-empty">No folders match</li>
+                      {/each}
+                    </ul>
+                  </div>
+                {/if}
+              </div>
               <div class="trash-wrap">
                 <button
                   type="button"
@@ -540,6 +725,111 @@
   .confirm-btn.danger:hover {
     background-color: var(--danger);
     color: var(--danger-contrast);
+  }
+
+  /* ---- Move-to-folder picker (mirrors the trash-confirm popover) ---- */
+  .move-wrap {
+    position: relative;
+    display: flex;
+  }
+
+  .move-wrap:has(.move-picker) .icon-button {
+    opacity: 1;
+  }
+
+  .popover-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 999;
+    border: none;
+    background: transparent;
+    cursor: default;
+  }
+
+  .move-picker {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 1000;
+    width: 240px;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background-color: var(--bg-panel);
+    box-shadow: var(--shadow-menu);
+  }
+
+  .move-filter {
+    width: 100%;
+    margin-bottom: 6px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background-color: var(--bg-input, var(--bg-panel));
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--font-ui);
+    box-sizing: border-box;
+  }
+
+  .move-filter:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .move-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+
+  .move-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 8px;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--font-ui);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .move-item-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .move-item.active:not(:disabled) {
+    background-color: var(--accent);
+    color: var(--accent-contrast);
+  }
+
+  .move-item:disabled,
+  .move-item.current {
+    color: var(--text-muted);
+    cursor: default;
+  }
+
+  .move-item-hint {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .move-empty {
+    padding: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
   }
 
   /* The bare "+ Add properties" affordance stays out of the way until the

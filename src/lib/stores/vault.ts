@@ -630,6 +630,37 @@ export async function renameNote(
   await refreshTree();
 }
 
+/**
+ * Moves the note at `oldRelPath` into `destFolder` (relative, "" = vault root),
+ * keeping its filename. Reuses the same `rename_path` backend as renames — a
+ * move is just a rename across folders. No-op when the note is already there.
+ * Throws (leaving the note where it was) if the destination already holds a
+ * note with that name; callers surface that via `vaultError`. On success the
+ * selection follows the note to its new path, the destination folder is
+ * expanded, the tree re-scans, and recency/tag views are nudged to refresh.
+ */
+export async function moveNote(
+  oldRelPath: string,
+  destFolder: string,
+): Promise<void> {
+  const idx = oldRelPath.lastIndexOf("/");
+  const name = idx === -1 ? oldRelPath : oldRelPath.slice(idx + 1);
+  const currentParent = idx === -1 ? "" : oldRelPath.slice(0, idx);
+  const dest = destFolder.replace(/\/+$/, "");
+  if (dest === currentParent) return;
+
+  const newRel = dest ? `${dest}/${name}` : name;
+  await invoke("rename_path", { oldRel: oldRelPath, newRel });
+
+  expandDir(dest);
+  remapPaths(oldRelPath, newRel);
+  await refreshTree();
+  // Like the trash flow, the backend suppresses the watcher for its own write,
+  // so no `vault-changed` fires; nudge the in-app index signal so recency/tag
+  // views re-fetch against the new path.
+  notifyNoteSaved();
+}
+
 /** Moves `node` to the OS Trash (backend never hard-deletes). */
 export async function deleteToTrash(node: TreeNode): Promise<void> {
   await invoke("trash_path", { relPath: node.path });
