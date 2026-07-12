@@ -143,6 +143,30 @@
   color: var(--text-muted);
 }
 
+/* The oneDark theme also ships near-black selection and active-line/gutter
+   backgrounds, which read as "black blocks" on our light --code-bg (and are
+   muddy even in dark mode). Repaint the selection layer with our accent tint
+   and flatten the active-line/gutter highlights in both themes. !important
+   outranks the theme's own .cm-focused selectors. */
+.milkdown .milkdown-code-block .cm-selectionBackground,
+.milkdown .milkdown-code-block .cm-editor.cm-focused .cm-selectionBackground {
+  background-color: color-mix(in srgb, var(--accent) 28%, transparent) !important;
+}
+
+.milkdown .milkdown-code-block .cm-content ::selection {
+  background-color: color-mix(in srgb, var(--accent) 28%, transparent);
+  color: inherit;
+}
+
+.milkdown .milkdown-code-block .cm-activeLine {
+  background-color: transparent;
+}
+
+.milkdown .milkdown-code-block .cm-activeLineGutter {
+  background-color: transparent;
+  color: var(--text-muted);
+}
+
 /* Content images (paste/drag/rendered): never overflow the column, soft
    corners. Applies to both the inline `<img>` node and Crepe's block image
    wrapper, in both themes. */
