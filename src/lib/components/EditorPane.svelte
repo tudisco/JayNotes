@@ -11,6 +11,7 @@
     vaultLocked,
     activeVault,
     unlockVault,
+    providers,
   } from "$lib/stores/vault";
   import { vaultChanged } from "$lib/stores/indexEvents";
   import {
@@ -125,12 +126,28 @@
     }
   }
 
-  // ---- encrypted-vault unlock prompt (shown in the main pane) ----
+  // ---- locked-vault unlock prompt (shown in the main pane) ----
   let unlockPassword = $state("");
   let unlockPassword2 = $state("");
   let unlockRemember = $state(false);
   let unlockError = $state("");
   let unlocking = $state(false);
+
+  // Provider metadata drives the panel copy: a hosted vault's unlock is a
+  // login, so its metadata carries unlockLabel "Sign in"; encrypted vaults
+  // fall back to "Unlock".
+  let unlockMeta = $derived(
+    $providers.find((p) => p.kind === $activeVault?.kind) ?? null,
+  );
+  let unlockLabel = $derived(unlockMeta?.unlockLabel ?? "Unlock");
+  let unlockBusyLabel = $derived(
+    unlockMeta?.unlockLabel ? "Signing in…" : "Unlocking…",
+  );
+  let unlockHint = $derived(
+    $activeVault?.kind === "tinylord"
+      ? "Sign in to your TinyLord server to open this vault."
+      : "Enter the password to open this encrypted vault.",
+  );
 
   // Clear the prompt whenever the active (locked) vault changes.
   $effect(() => {
@@ -231,9 +248,11 @@
     </div>
   {:else if $vaultLocked && $activeVault}
     <div class="unlock-pane">
-      <div class="lock-icon" aria-hidden="true">🔒</div>
+      <div class="lock-icon" aria-hidden="true">
+        {$activeVault.kind === "tinylord" ? "🌐" : "🔒"}
+      </div>
       <p class="unlock-title">{$activeVault.name} is locked</p>
-      <p class="unlock-hint">Enter the password to open this encrypted vault.</p>
+      <p class="unlock-hint">{unlockHint}</p>
       <form class="unlock-form" onsubmit={submitUnlock}>
         <!-- svelte-ignore a11y_autofocus -->
         <input
@@ -265,7 +284,7 @@
           type="submit"
           disabled={unlocking || !unlockPassword}
         >
-          {unlocking ? "Unlocking…" : "Unlock"}
+          {unlocking ? unlockBusyLabel : unlockLabel}
         </button>
       </form>
     </div>

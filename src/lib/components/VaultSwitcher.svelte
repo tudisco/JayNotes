@@ -18,6 +18,7 @@
     addVault,
     createVault,
     createEncryptedVault,
+    createTinylordVault,
     removeVault,
     renameVault,
     switchVault,
@@ -134,7 +135,13 @@
   function chooseProvider(p: ProviderMeta | null): void {
     if (!p) return;
     newProvider = p;
-    configValues = {};
+    // Seed the form with any field defaults from the provider metadata
+    // (e.g. tinylord's database = "jaynotes").
+    const seeded: Record<string, string> = {};
+    for (const f of p.configFields) {
+      if (f.default) seeded[f.key] = f.default;
+    }
+    configValues = seeded;
     rememberPassword = false;
     createError = "";
     newStep = "config";
@@ -184,6 +191,14 @@
           configValues.name,
           configValues.password,
           configValues.password2 ?? "",
+          rememberPassword,
+        );
+      } else if (p.kind === "tinylord") {
+        await createTinylordVault(
+          configValues.url,
+          configValues.database,
+          configValues.username,
+          configValues.password,
           rememberPassword,
         );
       } else {
@@ -306,7 +321,9 @@
                   : vault.path}
               onclick={() => pick(vault)}
             >
-              {#if vault.kind !== "plain"}
+              {#if vault.kind === "tinylord"}
+                <span class="dot dot-lock" aria-hidden="true">🌐</span>
+              {:else if vault.kind !== "plain"}
                 <span class="dot dot-lock" aria-hidden="true">🔒</span>
               {:else}
                 <span
@@ -365,7 +382,9 @@
               class="type-option"
               onclick={() => chooseProvider(p)}
             >
-              <span class="type-icon">{p.kind === "plain" ? "📁" : "🔒"}</span>
+              <span class="type-icon"
+                >{p.kind === "plain" ? "📁" : p.kind === "tinylord" ? "🌐" : "🔒"}</span
+              >
               <span class="type-text">
                 <span class="type-name">{p.displayName}</span>
                 <span class="type-desc">{p.description}</span>

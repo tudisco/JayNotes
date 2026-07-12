@@ -29,7 +29,7 @@ export interface ContextMenuState {
 // ---------------------------------------------------------------------------
 
 /** Vault kind, mirrored from the Rust `VaultKind` (`kind()` ids). */
-export type VaultKind = "plain" | "encrypted-db" | "encrypted-files";
+export type VaultKind = "plain" | "encrypted-db" | "encrypted-files" | "tinylord";
 
 /** On-disk status of a vault, mirrored from the Rust `VaultStatus`. */
 export type VaultStatus = "ok" | "offline" | "missing" | "unsupported";
@@ -59,6 +59,8 @@ export interface ConfigField {
   fieldType: "folder" | "text" | "password" | "url";
   required: boolean;
   placeholder?: string;
+  /** Pre-filled default value (e.g. tinylord's database = "jaynotes"). */
+  default?: string;
 }
 
 export interface Capabilities {
@@ -73,6 +75,8 @@ export interface ProviderMeta {
   description: string;
   configFields: ConfigField[];
   capabilities: Capabilities;
+  /** Verb for the unlock panel ("Sign in" for tinylord); default "Unlock". */
+  unlockLabel?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +149,15 @@ export const vaultLocked = writable(false);
 /** Capabilities of the currently open vault handle (drives capability UI). */
 export const activeCapabilities = writable<Capabilities | null>(null);
 
+/**
+ * Live connection state of a hosted (tinylord) vault's realtime streams:
+ * "connected" (or not applicable) vs "reconnecting" (the SSE feed dropped and
+ * is backing off). Drives the subtle banner over the file tree.
+ */
+export const hostedConnection = writable<"connected" | "reconnecting">(
+  "connected",
+);
+
 function currentActiveVault(): VaultInfo | null {
   const id = get(activeVaultId);
   return get(vaults).find((v) => v.id === id) ?? null;
@@ -157,6 +170,7 @@ function currentActiveVault(): VaultInfo | null {
 /** Called once on app start: loads providers + the vault list, opens the active one. */
 export async function initVault(): Promise<void> {
   try {
+    await initHostedEvents();
     await loadProviders();
     await loadVaults();
     await activateActive();
@@ -165,6 +179,37 @@ export async function initVault(): Promise<void> {
   } finally {
     vaultLoading.set(false);
   }
+}
+
+let hostedEventsBound = false;
+
+/**
+ * Registers the hosted-vault (tinylord) event listeners once:
+ * `tinylord-connection` flips the reconnecting banner, and
+ * `tinylord-session-expired` re-locks the vault so the sign-in panel shows.
+ */
+async function initHostedEvents(): Promise<void> {
+  if (hostedEventsBound) return;
+  hostedEventsBound = true;
+  const { listen } = await import("@tauri-apps/api/event");
+  await listen<{ vaultId: string; status: "connected" | "reconnecting" }>(
+    "tinylord-connection",
+    (event) => {
+      if (event.payload?.vaultId === get(activeVaultId)) {
+        hostedConnection.set(event.payload.status);
+      }
+    },
+  );
+  await listen<{ vaultId: string }>("tinylord-session-expired", (event) => {
+    if (event.payload?.vaultId !== get(activeVaultId)) return;
+    // The server rejected our refresh — force the sign-in panel.
+    vaultLocked.set(true);
+    fileTree.set(null);
+    selected.set(null);
+    activeCapabilities.set(null);
+    hostedConnection.set("connected");
+    vaultError.set("Session expired — sign in again.");
+  });
 }
 
 /** Loads the compiled provider metadata for the vault-type picker. */
@@ -187,6 +232,7 @@ async function activateActive(): Promise<void> {
   selected.set(null);
   expandedDirs.set(new Set());
   activeCapabilities.set(null);
+  hostedConnection.set("connected");
 
   if (!active || active.status === "missing") {
     vaultPath.set(null);
@@ -310,6 +356,30 @@ export async function createEncryptedFilesVault(
     name,
     password,
     password2: password2 || null,
+    remember,
+  });
+  await loadVaults();
+  await activateActive();
+  return vault.id;
+}
+
+/**
+ * Creates a new TinyLord hosted vault: verifies the login against the server,
+ * stores url + database + username (never the password) in settings, and opens
+ * it live. Returns the new vault id.
+ */
+export async function createTinylordVault(
+  url: string,
+  database: string,
+  username: string,
+  password: string,
+  remember: boolean,
+): Promise<string> {
+  const vault = await invoke<VaultInfo>("create_tinylord_vault", {
+    url,
+    database,
+    username,
+    password,
     remember,
   });
   await loadVaults();

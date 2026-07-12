@@ -9,6 +9,7 @@
     newItemTargetDir,
     newNote,
     activeVaultOffline,
+    hostedConnection,
     removedVaultNames,
     switchVault,
     vaultError,
@@ -99,6 +100,13 @@
       >
         ✕
       </button>
+    </div>
+  {/if}
+
+  {#if $hostedConnection === "reconnecting" && $activeVault?.kind === "tinylord"}
+    <div class="reconnecting" role="status">
+      <span class="reconnecting-dot" aria-hidden="true"></span>
+      Reconnecting to server…
     </div>
   {/if}
 
@@ -350,6 +358,39 @@
 
   .notice-dismiss:hover {
     color: var(--text);
+  }
+
+  /* Subtle "reconnecting" banner for a hosted (tinylord) vault whose realtime
+     stream dropped — the SSE loop is backing off and retrying. */
+  .reconnecting {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 6px 8px 0;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background-color: var(--bg-panel);
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .reconnecting-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background-color: #d9a441;
+    animation: reconnect-pulse 1.2s ease-in-out infinite;
+  }
+
+  @keyframes reconnect-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.3;
+    }
   }
 
   .tabs {
