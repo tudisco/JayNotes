@@ -38,10 +38,17 @@ pub mod encrypted_db;
 #[cfg(feature = "provider-encrypted-files")]
 pub mod encrypted_files;
 
+#[cfg(feature = "provider-tinylord")]
+pub mod tinylord;
+
 #[cfg(feature = "encryption")]
 pub mod crypto;
 
-#[cfg(feature = "encryption")]
+// The shared unlock/lock command layer exists whenever *any* provider needs
+// unlocking — every encrypted provider (the `encryption` umbrella) and the
+// hosted tinylord provider (whose unlock is a login, deliberately outside the
+// encryption umbrella).
+#[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
 pub mod unlock;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +67,10 @@ pub struct ConfigField {
     pub required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+    /// Pre-filled default value for the input (e.g. tinylord's `database` =
+    /// "jaynotes"). The frontend seeds the field with this when the form opens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 impl ConfigField {
@@ -74,7 +85,15 @@ impl ConfigField {
             } else {
                 Some(placeholder.to_string())
             },
+            default: None,
         }
+    }
+
+    /// Builder tweak: attach a pre-filled default value.
+    #[cfg(feature = "provider-tinylord")]
+    fn with_default(mut self, default: &str) -> Self {
+        self.default = Some(default.to_string());
+        self
     }
 }
 
@@ -102,6 +121,11 @@ pub struct ProviderMeta {
     pub description: String,
     pub config_fields: Vec<ConfigField>,
     pub capabilities: Capabilities,
+    /// Verb the unlock panel should use for this kind ("Unlock" by default, but
+    /// "Sign in" for a hosted vault whose unlock is a login). Optional; the
+    /// frontend falls back to "Unlock" when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlock_label: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +222,8 @@ const ENCRYPTED_DB: encrypted_db::EncryptedDbProvider = encrypted_db::EncryptedD
 #[cfg(feature = "provider-encrypted-files")]
 const ENCRYPTED_FILES: encrypted_files::EncryptedFilesProvider =
     encrypted_files::EncryptedFilesProvider;
+#[cfg(feature = "provider-tinylord")]
+const TINYLORD: tinylord::TinylordProvider = tinylord::TinylordProvider;
 
 /// Every provider compiled into this build, plain first. Assembled with
 /// `#[cfg]` so an omitted feature drops both the module and its entry.
@@ -208,6 +234,8 @@ pub fn providers() -> Vec<&'static dyn VaultProvider> {
     list.push(&ENCRYPTED_DB);
     #[cfg(feature = "provider-encrypted-files")]
     list.push(&ENCRYPTED_FILES);
+    #[cfg(feature = "provider-tinylord")]
+    list.push(&TINYLORD);
     list
 }
 
@@ -247,6 +275,10 @@ pub fn try_auto_open(
     #[cfg(feature = "provider-encrypted-files")]
     if vault.kind == crate::vault::VaultKind::EncryptedFiles {
         return encrypted_files::auto_open(app, state, vault);
+    }
+    #[cfg(feature = "provider-tinylord")]
+    if vault.kind == crate::vault::VaultKind::Tinylord {
+        return tinylord::auto_open(app, state, vault);
     }
     let _ = (app, state, vault);
     false

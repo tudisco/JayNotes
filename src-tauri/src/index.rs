@@ -1260,6 +1260,50 @@ pub(crate) fn open_keyed_index(
     Index::open_keyed(&db_path, vault_root, Some(key))
 }
 
+/// Opens (or creates) a plain, **unkeyed** index for a vault keyed by an
+/// arbitrary string (rather than a filesystem path). Used by the `tinylord`
+/// provider, whose "root" is a server URL, not a directory: the index lives at
+/// the standard `app_data/indexes/<hash>.db` location and is populated by the
+/// handle from documents fetched over HTTP. The index carries a dummy
+/// `vault_root` (the indexes dir) because a tinylord index is never
+/// `full_scan()`ned — the handle drives every upsert — so `vault_root` is only a
+/// harmless base for the (always-missing) per-file `stat`.
+#[cfg(feature = "provider-tinylord")]
+pub(crate) fn open_unkeyed_index_for_key(
+    app: &tauri::AppHandle,
+    key: &str,
+) -> Result<Index, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not resolve app data dir: {e}"))?
+        .join("indexes");
+    let db_path = dir.join(format!("{}.db", hash_path(key)));
+    // `dir` doubles as the dummy vault root; it always exists after open.
+    Index::open(&db_path, &dir)
+}
+
+/// True if `rel` was registered as a self-write within the last 2 seconds (the
+/// same window the file watcher uses). Exposed for the tinylord SSE handler,
+/// which must suppress the server's echo of our own writes. Also prunes stale
+/// entries so the map cannot grow unbounded.
+#[cfg(feature = "provider-tinylord")]
+pub fn was_recently_written(
+    recent: &Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    rel: &str,
+) -> bool {
+    use std::time::Duration;
+    let now = std::time::Instant::now();
+    let mut map = match recent.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    map.retain(|_, t| now.duration_since(*t) < Duration::from_secs(5));
+    map.get(rel)
+        .map(|t| now.duration_since(*t) < Duration::from_secs(2))
+        .unwrap_or(false)
+}
+
 /// Opens the index for `vault_root`, starts a fresh file watcher, and kicks off
 /// a background full scan that emits `index-ready` when done. Any previous
 /// watcher is dropped (stopping it). Called on startup and on `set_vault`.

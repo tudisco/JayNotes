@@ -97,6 +97,7 @@ impl VaultProvider for EncryptedFilesProvider {
                 ),
             ],
             capabilities: Self::CAPS,
+            unlock_label: None,
         }
     }
 }

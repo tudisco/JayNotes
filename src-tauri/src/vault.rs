@@ -41,6 +41,12 @@ pub enum VaultKind {
     /// present so a settings file written by a full build still deserializes in
     /// a build without the feature (shows "unsupported").
     EncryptedFiles,
+    /// M16: TinyLord hosted vault — notes are documents on a self-hosted TinyLord
+    /// server, kept live over SSE. `path` holds the base URL (not a local path).
+    /// Gated behind `provider-tinylord`; the variant is always present so a
+    /// settings file from a full build still deserializes without the feature
+    /// (shows "unsupported").
+    Tinylord,
 }
 
 impl VaultKind {
@@ -50,6 +56,7 @@ impl VaultKind {
             VaultKind::Plain => "plain",
             VaultKind::EncryptedDb => "encrypted-db",
             VaultKind::EncryptedFiles => "encrypted-files",
+            VaultKind::Tinylord => "tinylord",
         }
     }
 }

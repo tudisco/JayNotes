@@ -36,6 +36,7 @@ impl VaultProvider for PlainProvider {
                 field("name", "Vault name", "text", true, "My Notes"),
             ],
             capabilities: Self::CAPS,
+            unlock_label: None,
         }
     }
 }

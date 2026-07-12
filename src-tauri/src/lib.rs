@@ -22,6 +22,10 @@ pub fn run() {
     #[cfg(feature = "encryption")]
     let builder = builder.manage(providers::crypto::SecretsSession::default());
 
+    // The tinylord login-session state exists only when that provider is built.
+    #[cfg(feature = "provider-tinylord")]
+    let builder = builder.manage(providers::tinylord::TinyLordSessions::default());
+
     builder
         .setup(|app| {
             // On startup, open the active vault's backend (plain always; an
@@ -51,15 +55,17 @@ pub fn run() {
             providers::encrypted_db::create_encrypted_vault,
             #[cfg(feature = "provider-encrypted-files")]
             providers::encrypted_files::create_encrypted_files_vault,
-            // Shared unlock/lock commands (present whenever any encrypted
+            #[cfg(feature = "provider-tinylord")]
+            providers::tinylord::create_tinylord_vault,
+            // Shared unlock/lock commands (present whenever any needs-unlock
             // provider is built), dispatching by vault kind.
-            #[cfg(feature = "encryption")]
+            #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
             providers::unlock::vault_needs_unlock,
-            #[cfg(feature = "encryption")]
+            #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
             providers::unlock::unlock_vault,
-            #[cfg(feature = "encryption")]
+            #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
             providers::unlock::unlock_remembered,
-            #[cfg(feature = "encryption")]
+            #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
             providers::unlock::lock_vault,
             vault::scan_vault,
             vault::read_note,

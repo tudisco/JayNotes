@@ -90,6 +90,13 @@ fn status_of_vault(vault: &Vault) -> VaultStatus {
     if !crate::providers::kind_supported(vault.kind.as_str()) {
         return VaultStatus::Unsupported;
     }
+    // A TinyLord vault's `path` is a server URL, not a local directory, so the
+    // filesystem ok/offline/missing heuristic doesn't apply — it must never be
+    // pruned for a "missing folder". Reachability is a runtime concern surfaced
+    // by the reconnecting banner, so it always classifies as Ok when supported.
+    if vault.kind == VaultKind::Tinylord {
+        return VaultStatus::Ok;
+    }
     classify_status(&vault.path, &|p| p.exists())
 }
 
@@ -384,13 +391,18 @@ pub async fn switch_vault(
         return Ok(canonical.to_string_lossy().into_owned());
     }
 
-    // Non-plain (encrypted-db, …): the container file must be present.
-    let file = Path::new(&vault.path);
-    if !file.exists() {
-        return Err(format!(
-            "Vault '{}' is not reachable — is the drive connected?",
-            vault.name
-        ));
+    // A TinyLord vault has no local file to check — reachability is decided when
+    // we (silently) connect below; if that fails it stays locked and the unlock
+    // panel prompts for the login.
+    if vault.kind != VaultKind::Tinylord {
+        // Non-plain, non-tinylord (encrypted-db/-files): the container must exist.
+        let file = Path::new(&vault.path);
+        if !file.exists() {
+            return Err(format!(
+                "Vault '{}' is not reachable — is the drive connected?",
+                vault.name
+            ));
+        }
     }
     settings.active_vault_id = Some(id);
     save_settings(&app, &settings)?;

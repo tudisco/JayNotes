@@ -67,6 +67,7 @@ impl VaultProvider for EncryptedDbProvider {
                 field("confirm", "Confirm password", "password", true, "Re-enter the password"),
             ],
             capabilities: Self::CAPS,
+            unlock_label: None,
         }
     }
 }

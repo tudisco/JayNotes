@@ -152,7 +152,7 @@ impl Revisions {
 // [`Revisions`] API but take `&AppState` and dispatch through `with_active`.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "encryption")]
+#[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
 mod handle_backed {
     use super::*;
     use crate::index::AppState;
@@ -236,7 +236,7 @@ mod handle_backed {
     }
 }
 
-#[cfg(feature = "encryption")]
+#[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
 pub use handle_backed::{
     get as handle_get, list as handle_list, snapshot as handle_snapshot,
 };

@@ -47,10 +47,12 @@ use tools::{RevisionSink, ToolContext};
 use crate::index::AppState;
 use crate::vault;
 
-/// True when the active vault is an encrypted (needs-unlock) vault, so undo
-/// snapshots must be stored encrypted inside the vault rather than as plaintext
-/// files in app-data. Only exists in a build with an encrypted provider.
-#[cfg(feature = "encryption")]
+/// True when the active vault is a needs-unlock vault (encrypted, or hosted
+/// tinylord), so undo snapshots must be stored *inside the vault* through its
+/// handle — encrypted alongside the notes, or as documents on the server —
+/// rather than as plaintext files in app-data. Only exists in a build with such
+/// a provider.
+#[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
 fn active_is_encrypted(state: &AppState) -> bool {
     state
         .active
@@ -65,7 +67,7 @@ fn active_is_encrypted(state: &AppState) -> bool {
 /// snapshots inside the vault (`.revisions/`), plain vaults in app-data.
 fn build_revision_sink(app: &tauri::AppHandle, state: &AppState) -> Result<RevisionSink, String> {
     let _ = state; // used only by the encrypted branch below
-    #[cfg(feature = "encryption")]
+    #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
     if active_is_encrypted(state) {
         return Ok(RevisionSink::Handle);
     }
@@ -625,7 +627,7 @@ pub async fn ai_list_revisions(
     path: String,
 ) -> Result<Vec<RevisionMeta>, String> {
     let _ = &state; // used only by the encrypted branch below
-    #[cfg(feature = "encryption")]
+    #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
     if active_is_encrypted(state.inner()) {
         return Ok(revisions::handle_list(state.inner(), &path));
     }
@@ -645,7 +647,7 @@ pub async fn ai_revert(
 ) -> Result<String, String> {
     let st = state.inner();
 
-    #[cfg(feature = "encryption")]
+    #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
     if active_is_encrypted(st) {
         let (path, content) = revisions::handle_get(st, &revision_id)?;
         // Snapshot current content first so the revert is itself revertible.

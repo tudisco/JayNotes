@@ -22,7 +22,7 @@ tauri-build = { version = "2", features = [] }
 # providers OUT with `--no-default-features` plus an explicit list. The frontend
 # hardcodes nothing (see `list_providers`), so an omitted provider leaves zero
 # UI trace and a saved vault of that kind shows "unsupported in this build".
-default = ["provider-encrypted-db", "provider-encrypted-files"]
+default = ["provider-encrypted-db", "provider-encrypted-files", "provider-tinylord"]
 # Internal umbrella pulled in by every encrypted provider: the shared KDF,
 # unlock-session, and OS-keyring plumbing (compiled only when something needs it).
 encryption = ["dep:keyring", "dep:scrypt", "dep:zeroize"]
@@ -31,8 +31,19 @@ provider-encrypted-db = ["encryption"]
 # library (rclone-compatible names + content). Pulls in the encryption umbrella
 # and the path-dependency library.
 provider-encrypted-files = ["encryption", "dep:rclone-crypt"]
-# Declared placeholder for M16; no module yet.
-provider-tinylord = []
+# M16: TinyLord hosted vault (per-instance URL + login). Server is source of
+# truth; a local FTS index mirror is kept live over SSE. Deliberately does NOT
+# pull the `encryption` umbrella — its "remember" path stores the login password
+# in the OS keyring (tokens expire/rotate), so it only needs `keyring` + `zeroize`
+# for in-memory password hygiene, plus a tokio runtime able to run the reqwest
+# reactor and the background SSE tasks. `reqwest` (rustls+json+stream+http2) is
+# already an unconditional dependency of the crate, so nothing HTTP is gated here.
+provider-tinylord = [
+    "dep:keyring",
+    "dep:zeroize",
+    "tokio/rt-multi-thread",
+    "tokio/net",
+]
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }

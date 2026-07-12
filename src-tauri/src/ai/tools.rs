@@ -24,7 +24,7 @@ use crate::vault::{with_active, TreeNode};
 /// (encrypted vaults, so snapshot content never leaks to app-data).
 pub enum RevisionSink {
     Fs(Revisions),
-    #[cfg(feature = "encryption")]
+    #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
     Handle,
 }
 
@@ -45,7 +45,7 @@ impl ToolContext<'_> {
     fn snapshot(&self, rel: &str, content: &str) -> Result<String, String> {
         match &self.revisions {
             RevisionSink::Fs(r) => r.snapshot(rel, content),
-            #[cfg(feature = "encryption")]
+            #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
             RevisionSink::Handle => super::revisions::handle_snapshot(self.state, rel, content),
         }
     }
