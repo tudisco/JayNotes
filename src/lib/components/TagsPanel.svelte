@@ -1,7 +1,7 @@
 <script lang="ts">
   import { listTags, notesByTag, type SearchHit, type TagCount } from "$lib/stores/search";
-  import { selected, vaultError } from "$lib/stores/vault";
-  import { vaultChanged } from "$lib/stores/indexEvents";
+  import { openContextMenu, selected, vaultError, type TreeNode } from "$lib/stores/vault";
+  import { noteSaved, vaultChanged } from "$lib/stores/indexEvents";
 
   let tags = $state<TagCount[]>([]);
   let loaded = $state(false);
@@ -19,12 +19,17 @@
       .catch((e) => vaultError.set(String(e)));
   }
 
-  // Initial load, and refresh whenever the vault changes on disk.
+  // Initial load, refresh on external vault changes, and on in-app index edits
+  // (self-writes never emit `vault-changed`; `noteSaved` is bumped after a
+  // context-menu delete so an emptied tag drops out and its note list updates).
   let lastSeq = -1;
+  let lastSaveSeq = -1;
   $effect(() => {
     const seq = $vaultChanged.seq;
-    if (seq !== lastSeq) {
+    const saveSeq = $noteSaved;
+    if (seq !== lastSeq || saveSeq !== lastSaveSeq) {
       lastSeq = seq;
+      lastSaveSeq = saveSeq;
       loadTags();
       // If a tag is open, refresh its note list too (it may have changed).
       if (activeTag) openTag(activeTag);
@@ -56,6 +61,27 @@
     selected.set({ path: hit.path, isDir: false });
   }
 
+  function fileName(path: string): string {
+    const idx = path.lastIndexOf("/");
+    return idx === -1 ? path : path.slice(idx + 1);
+  }
+
+  /** A minimal TreeNode so the shared ContextMenu can act on a tag-list row. */
+  function nodeOf(hit: SearchHit): TreeNode {
+    return { name: fileName(hit.path), path: hit.path, isDir: false, children: [] };
+  }
+
+  // Right-click opens the same shared ContextMenu as the tree/recent rows
+  // (rename / delete-with-confirm / reveal-in-Finder, capability-gated). Rename
+  // from here sets the shared `renamingPath`; there is no inline rename row in
+  // this panel, so the rename input appears in the file tree (Files tab).
+  function handleContextMenu(event: MouseEvent, hit: SearchHit): void {
+    event.preventDefault();
+    event.stopPropagation();
+    selected.set({ path: hit.path, isDir: false });
+    openContextMenu(event.clientX, event.clientY, nodeOf(hit));
+  }
+
   function relDir(path: string): string {
     const idx = path.lastIndexOf("/");
     return idx === -1 ? "" : path.slice(0, idx);
@@ -82,7 +108,13 @@
       <ul class="hit-list">
         {#each hits as hit (hit.path)}
           <li>
-            <button type="button" class="hit" onclick={() => open(hit)} title={hit.path}>
+            <button
+              type="button"
+              class="hit"
+              onclick={() => open(hit)}
+              oncontextmenu={(e) => handleContextMenu(e, hit)}
+              title={hit.path}
+            >
               <span class="hit-title">{hit.title}</span>
               {#if relDir(hit.path)}
                 <span class="hit-path">{relDir(hit.path)}</span>

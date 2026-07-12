@@ -6,6 +6,7 @@
   import PropertiesBar from "./PropertiesBar.svelte";
   import {
     renameNote,
+    deleteToTrash,
     selected,
     vaultError,
     vaultLocked,
@@ -126,6 +127,29 @@
     }
   }
 
+  // "Move to Trash": a small inline confirm popover (no native alert) anchored
+  // to the trashcan button. Confirming trashes the open note through the shared
+  // store helper, which clears the selection (editor returns to "No note open")
+  // and refreshes the tree; errors surface via the usual vaultError path.
+  let confirmingTrash = $state(false);
+
+  // Reset the confirm step whenever the open note changes.
+  $effect(() => {
+    void notePath;
+    confirmingTrash = false;
+  });
+
+  async function trashNote(): Promise<void> {
+    const p = notePath;
+    confirmingTrash = false;
+    if (!p) return;
+    try {
+      await deleteToTrash({ name: baseName(p), path: p, isDir: false, children: [] });
+    } catch (e) {
+      vaultError.set(String(e));
+    }
+  }
+
   // ---- locked-vault unlock prompt (shown in the main pane) ----
   let unlockPassword = $state("");
   let unlockPassword2 = $state("");
@@ -180,6 +204,12 @@
     }
   }
 
+  function onWindowKeydown(event: KeyboardEvent): void {
+    if (event.key === "Escape" && confirmingTrash) {
+      confirmingTrash = false;
+    }
+  }
+
   function onTitleKey(event: KeyboardEvent): void {
     const input = event.currentTarget as HTMLInputElement;
     if (event.key === "Enter") {
@@ -192,6 +222,8 @@
     }
   }
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 <section class="editor-pane" class:has-note={fileSelected}>
   {#if fileSelected && notePath}
@@ -239,6 +271,60 @@
                   <path d="M9 15l3 3 3-3" />
                 </svg>
               </button>
+              <div class="trash-wrap">
+                <button
+                  type="button"
+                  class="icon-button"
+                  title="Move to Trash"
+                  aria-label="Move to Trash"
+                  onclick={() => (confirmingTrash = !confirmingTrash)}
+                >
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                    <line x1="10" y1="11" x2="10" y2="17" />
+                    <line x1="14" y1="11" x2="14" y2="17" />
+                  </svg>
+                </button>
+                {#if confirmingTrash}
+                  <!-- Click-away backdrop + Escape both cancel the confirm. -->
+                  <button
+                    type="button"
+                    class="trash-backdrop"
+                    aria-label="Cancel move to Trash"
+                    onclick={() => (confirmingTrash = false)}
+                  ></button>
+                  <div class="trash-confirm" role="dialog" aria-label="Move to Trash">
+                    <p class="trash-confirm-text">Move to Trash?</p>
+                    <div class="trash-confirm-actions">
+                      <button
+                        type="button"
+                        class="confirm-btn danger"
+                        onclick={trashNote}
+                      >
+                        Trash
+                      </button>
+                      <button
+                        type="button"
+                        class="confirm-btn"
+                        onclick={() => (confirmingTrash = false)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+              </div>
             </div>
           </header>
           <PropertiesBar {frontmatter} onChange={onPropertiesChange} />
@@ -385,6 +471,75 @@
     opacity: 1;
     color: var(--text-muted);
     cursor: default;
+  }
+
+  /* Keep the trashcan visible while its confirm popover is open. */
+  .trash-wrap {
+    position: relative;
+    display: flex;
+  }
+
+  .trash-wrap:has(.trash-confirm) .icon-button {
+    opacity: 1;
+  }
+
+  .trash-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 999;
+    border: none;
+    background: transparent;
+    cursor: default;
+  }
+
+  .trash-confirm {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 1000;
+    width: 168px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background-color: var(--bg-panel);
+    box-shadow: var(--shadow-menu);
+  }
+
+  .trash-confirm-text {
+    margin: 0 0 8px;
+    font-size: 13px;
+    color: var(--text);
+  }
+
+  .trash-confirm-actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  .confirm-btn {
+    flex: 1;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background-color: var(--bg-panel);
+    color: var(--text);
+    font-size: 12px;
+    font-family: var(--font-ui);
+    cursor: pointer;
+  }
+
+  .confirm-btn:hover {
+    background-color: var(--hover);
+  }
+
+  .confirm-btn.danger {
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+
+  .confirm-btn.danger:hover {
+    background-color: var(--danger);
+    color: var(--danger-contrast);
   }
 
   /* The bare "+ Add properties" affordance stays out of the way until the

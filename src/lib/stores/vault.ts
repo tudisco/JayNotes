@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { derived, get, writable } from "svelte/store";
+import { notifyNoteSaved } from "./indexEvents";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -645,6 +646,11 @@ export async function deleteToTrash(node: TreeNode): Promise<void> {
       ),
   );
   await refreshTree();
+  // The backend updates the search index synchronously on trash but suppresses
+  // the watcher for its own writes, so no `vault-changed` fires. Bump the
+  // in-app "index changed" signal so recency/tag views (RecentList, TagsPanel)
+  // re-fetch and drop the now-gone note (and any emptied tag).
+  notifyNoteSaved();
 }
 
 export function revealInFinder(node: TreeNode): Promise<void> {
