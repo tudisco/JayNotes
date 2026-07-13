@@ -15,8 +15,16 @@
     activeVault,
     unlockVault,
     providers,
+    vaults,
+    activeVaultId,
+    ensureVisible,
+    transferNote,
+    listVaultFolders,
+    unlockTransferDest,
+    type VaultInfo,
   } from "$lib/stores/vault";
   import { collectFolderPaths } from "$lib/utils/path";
+  import { sidebarMode, filesView } from "$lib/stores/ui";
   import { vaultChanged } from "$lib/stores/indexEvents";
   import {
     editorReloadNonce,
@@ -143,6 +151,198 @@
   let moveFilter = $state("");
   let moveActiveIndex = $state(0);
 
+  // The move popover is a small step machine: "folders" is the in-vault folder
+  // list plus an "Other vaults" section (Job A); choosing another vault steps to
+  // "vault-folders" (that vault's folder list, or an inline unlock when it's
+  // locked), and choosing a folder there steps to "confirm".
+  type MoveView = "folders" | "vault-folders" | "confirm";
+  let moveView = $state<MoveView>("folders");
+  let transferTarget = $state<VaultInfo | null>(null);
+  let transferFolders = $state<string[]>([]);
+  let transferFoldersLoading = $state(false);
+  let transferError = $state("");
+  let transferDestFolder = $state<string | null>(null);
+  let transferBusy = $state(false);
+  // When set, the target vault is locked and this row shows an inline unlock.
+  let unlockingTargetId = $state<string | null>(null);
+  let tUnlockPw = $state("");
+  let tUnlockPw2 = $state("");
+  let tUnlockRemember = $state(false);
+  let tUnlockError = $state("");
+  let tUnlocking = $state(false);
+  // Transient "Moved to <vault>" notice shown after the note leaves this vault.
+  let movedNotice = $state<string | null>(null);
+
+  // Kind glyphs for the "Other vaults" rows (mirrors the unlock-pane icons).
+  const kindGlyph: Record<string, string> = {
+    plain: "📁",
+    "encrypted-db": "🔒",
+    "encrypted-files": "🗄️",
+    tinylord: "🌐",
+  };
+
+  interface OtherVault {
+    vault: VaultInfo;
+    glyph: string;
+    disabled: boolean;
+    reason: string; // shown dimmed when disabled
+  }
+
+  // Every configured vault except the active (source) one, with a readiness
+  // verdict. Encrypted vaults aren't pre-checked for unlock here — clicking one
+  // tries to open it and falls into the inline unlock only if it reports locked.
+  let otherVaults = $derived.by<OtherVault[]>(() =>
+    $vaults
+      .filter((v) => v.id !== $activeVaultId)
+      .map((v) => {
+        let disabled = false;
+        let reason = "";
+        if (v.status === "offline") {
+          disabled = true;
+          reason = "drive offline";
+        } else if (v.status === "unsupported") {
+          disabled = true;
+          reason = "unsupported build";
+        } else if (v.kind === "tinylord") {
+          disabled = true;
+          reason = "hosted — can't receive";
+        }
+        return { vault: v, glyph: kindGlyph[v.kind] ?? "📁", disabled, reason };
+      }),
+  );
+
+  // The plaintext-Trash warning applies when moving OUT of a plain vault INTO an
+  // encrypted one: the OS Trash copy of the original stays readable in the clear.
+  let showPlaintextWarning = $derived(
+    $activeVault?.kind === "plain" &&
+      (transferTarget?.kind === "encrypted-db" ||
+        transferTarget?.kind === "encrypted-files"),
+  );
+
+  function resetTransferState(): void {
+    moveView = "folders";
+    transferTarget = null;
+    transferFolders = [];
+    transferFoldersLoading = false;
+    transferError = "";
+    transferDestFolder = null;
+    transferBusy = false;
+    unlockingTargetId = null;
+    tUnlockPw = "";
+    tUnlockPw2 = "";
+    tUnlockError = "";
+    tUnlocking = false;
+  }
+
+  async function chooseTargetVault(v: VaultInfo): Promise<void> {
+    transferTarget = v;
+    transferError = "";
+    transferFolders = [];
+    unlockingTargetId = null;
+    moveView = "vault-folders";
+    await loadTargetFolders();
+  }
+
+  async function loadTargetFolders(): Promise<void> {
+    if (!transferTarget) return;
+    transferFoldersLoading = true;
+    transferError = "";
+    try {
+      transferFolders = await listVaultFolders(transferTarget.id);
+      unlockingTargetId = null;
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("dest-locked")) {
+        unlockingTargetId = transferTarget.id; // show the inline unlock
+      } else {
+        transferError = msg;
+      }
+    } finally {
+      transferFoldersLoading = false;
+    }
+  }
+
+  async function submitTargetUnlock(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    const v = transferTarget;
+    if (!v || tUnlocking || !tUnlockPw) return;
+    tUnlocking = true;
+    tUnlockError = "";
+    try {
+      const extra =
+        v.kind === "encrypted-files" && tUnlockPw2
+          ? { password2: tUnlockPw2 }
+          : undefined;
+      await unlockTransferDest(v.id, tUnlockPw, tUnlockRemember, extra);
+      tUnlockPw = "";
+      tUnlockPw2 = "";
+      await loadTargetFolders(); // now unlocked → its folders
+    } catch (e) {
+      tUnlockError = String(e);
+    } finally {
+      tUnlocking = false;
+    }
+  }
+
+  function chooseTargetFolder(folder: string): void {
+    transferDestFolder = folder;
+    moveView = "confirm";
+  }
+
+  function backToVaultList(): void {
+    moveView = "folders";
+    transferTarget = null;
+    transferError = "";
+    unlockingTargetId = null;
+  }
+
+  async function doTransfer(): Promise<void> {
+    const p = notePath;
+    const v = transferTarget;
+    if (!p || !v || transferDestFolder === null || transferBusy) return;
+    transferBusy = true;
+    transferError = "";
+    try {
+      // Flush pending edits before the note leaves this vault (same rule the
+      // in-vault move follows) so a debounced autosave can't race the transfer.
+      await editor?.flush();
+      await transferNote(p, v.id, transferDestFolder);
+      pickingMove = false;
+      resetTransferState();
+      showMovedNotice(v.name);
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("dest-locked")) {
+        // The key expired between steps — drop back to the unlock prompt.
+        unlockingTargetId = v.id;
+        moveView = "vault-folders";
+      } else {
+        transferError = msg;
+      }
+    } finally {
+      transferBusy = false;
+    }
+  }
+
+  function showMovedNotice(vaultName: string): void {
+    movedNotice = `Moved to ${vaultName}`;
+    setTimeout(() => {
+      if (movedNotice === `Moved to ${vaultName}`) movedNotice = null;
+    }, 2800);
+  }
+
+  // Job B: reveal the open note in the file tree — switch the sidebar to Files
+  // (tree mode) and expand its ancestor folders. Cheap; the note is already the
+  // selection so no scroll bookkeeping is needed.
+  function revealInTree(): void {
+    const p = notePath;
+    if (!p) return;
+    sidebarMode.set("files");
+    filesView.set("tree");
+    ensureVisible(p);
+    selected.set({ path: p, isDir: false });
+  }
+
   function parentDir(path: string): string {
     const i = path.lastIndexOf("/");
     return i === -1 ? "" : path.slice(0, i);
@@ -197,11 +397,13 @@
     confirmingTrash = false; // one popover at a time
     moveFilter = "";
     moveActiveIndex = 0;
+    resetTransferState();
     pickingMove = true;
   }
 
   function closeMovePicker(): void {
     pickingMove = false;
+    resetTransferState();
   }
 
   // Reset both popovers whenever the open note changes.
@@ -209,6 +411,7 @@
     void notePath;
     confirmingTrash = false;
     pickingMove = false;
+    resetTransferState();
   });
 
   async function moveTo(dest: string): Promise<void> {
@@ -313,8 +516,15 @@
     }
     if (pickingMove) {
       if (event.key === "Escape") {
-        closeMovePicker();
-      } else {
+        // Escape steps back one level, then closes from the vault list.
+        if (moveView === "confirm") {
+          moveView = "vault-folders";
+        } else if (moveView === "vault-folders") {
+          backToVaultList();
+        } else {
+          closeMovePicker();
+        }
+      } else if (moveView === "folders") {
         onMoveKeydown(event);
       }
     }
@@ -336,20 +546,39 @@
 <svelte:window onkeydown={onWindowKeydown} />
 
 <section class="editor-pane" class:has-note={fileSelected}>
+  {#if movedNotice}
+    <div class="moved-notice" role="status">{movedNotice}</div>
+  {/if}
   {#if fileSelected && notePath}
     <div class="note-view">
       {#key `${notePath}:${reloadNonce}`}
         <div class="note-meta">
           <header class="note-header">
-            <input
-              class="note-title"
-              type="text"
-              bind:value={titleDraft}
-              spellcheck="false"
-              aria-label="Note title"
-              onkeydown={onTitleKey}
-              onblur={commitTitle}
-            />
+            <div class="note-title-wrap">
+              {#if currentFolder}
+                <button
+                  type="button"
+                  class="note-path"
+                  title="Reveal in file tree"
+                  onclick={revealInTree}
+                >
+                  {#each currentFolder.split("/") as seg, i (i)}
+                    {#if i > 0}<span class="note-path-sep">/</span>{/if}<span
+                      class="note-path-seg">{seg}</span
+                    >
+                  {/each}
+                </button>
+              {/if}
+              <input
+                class="note-title"
+                type="text"
+                bind:value={titleDraft}
+                spellcheck="false"
+                aria-label="Note title"
+                onkeydown={onTitleKey}
+                onblur={commitTitle}
+              />
+            </div>
             <div class="note-actions">
               {#if exportStatus === "exporting"}
                 <span class="export-status">Exporting…</span>
@@ -415,44 +644,202 @@
                     aria-label="Cancel move to folder"
                     onclick={closeMovePicker}
                   ></button>
-                  <div class="move-picker" role="menu" aria-label="Move to folder">
-                    {#if showMoveFilter}
-                      <!-- svelte-ignore a11y_autofocus -->
-                      <input
-                        class="move-filter"
-                        type="text"
-                        placeholder="Filter folders…"
-                        autocomplete="off"
-                        spellcheck="false"
-                        autofocus
-                        bind:value={moveFilter}
-                        oninput={() => (moveActiveIndex = 0)}
-                      />
-                    {/if}
-                    <ul class="move-list">
-                      {#each moveOptions as opt, i (opt.path)}
-                        <li>
+                  <div class="move-picker" role="menu" aria-label="Move note">
+                    {#if moveView === "folders"}
+                      {#if showMoveFilter}
+                        <!-- svelte-ignore a11y_autofocus -->
+                        <input
+                          class="move-filter"
+                          type="text"
+                          placeholder="Filter folders…"
+                          autocomplete="off"
+                          spellcheck="false"
+                          autofocus
+                          bind:value={moveFilter}
+                          oninput={() => (moveActiveIndex = 0)}
+                        />
+                      {/if}
+                      <ul class="move-list">
+                        {#each moveOptions as opt, i (opt.path)}
+                          <li>
+                            <button
+                              type="button"
+                              class="move-item"
+                              class:active={i === moveActiveIndex}
+                              class:current={opt.disabled}
+                              role="menuitem"
+                              disabled={opt.disabled}
+                              style:padding-left="{8 + opt.depth * 12}px"
+                              onmouseenter={() => (moveActiveIndex = i)}
+                              onclick={() => moveTo(opt.path)}
+                            >
+                              <span class="move-item-label">{opt.label}</span>
+                              {#if opt.disabled}
+                                <span class="move-item-hint">current</span>
+                              {/if}
+                            </button>
+                          </li>
+                        {:else}
+                          <li class="move-empty">No folders match</li>
+                        {/each}
+                      </ul>
+
+                      {#if otherVaults.length > 0}
+                        <div class="move-sep" role="separator"></div>
+                        <p class="move-section-label">Other vaults</p>
+                        <ul class="move-list">
+                          {#each otherVaults as ov (ov.vault.id)}
+                            <li>
+                              <button
+                                type="button"
+                                class="move-item vault-row"
+                                role="menuitem"
+                                disabled={ov.disabled}
+                                onclick={() => chooseTargetVault(ov.vault)}
+                              >
+                                <span class="vault-glyph" aria-hidden="true"
+                                  >{ov.glyph}</span
+                                >
+                                <span class="move-item-label">{ov.vault.name}</span>
+                                {#if ov.disabled}
+                                  <span class="move-item-hint">{ov.reason}</span>
+                                {:else}
+                                  <span class="vault-chevron" aria-hidden="true"
+                                    >›</span
+                                  >
+                                {/if}
+                              </button>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                    {:else if moveView === "vault-folders"}
+                      <div class="move-subhead">
+                        <button
+                          type="button"
+                          class="back-btn"
+                          aria-label="Back to vault list"
+                          onclick={backToVaultList}>‹</button
+                        >
+                        <span class="move-subhead-title"
+                          >{transferTarget?.name}</span
+                        >
+                      </div>
+                      {#if unlockingTargetId}
+                        <form class="t-unlock" onsubmit={submitTargetUnlock}>
+                          <p class="t-unlock-hint">Unlock this vault first.</p>
+                          <!-- svelte-ignore a11y_autofocus -->
+                          <input
+                            class="move-filter"
+                            type="password"
+                            placeholder="Password"
+                            autocomplete="off"
+                            autofocus
+                            bind:value={tUnlockPw}
+                          />
+                          {#if transferTarget?.kind === "encrypted-files"}
+                            <input
+                              class="move-filter"
+                              type="text"
+                              placeholder="Salt / second password (optional)"
+                              autocomplete="off"
+                              bind:value={tUnlockPw2}
+                            />
+                          {/if}
+                          <label class="t-remember">
+                            <input type="checkbox" bind:checked={tUnlockRemember} />
+                            Remember
+                          </label>
+                          {#if tUnlockError}
+                            <p class="t-error">{tUnlockError}</p>
+                          {/if}
+                          <button
+                            type="submit"
+                            class="confirm-btn primary"
+                            disabled={tUnlocking || !tUnlockPw}
+                          >
+                            {tUnlocking ? "Unlocking…" : "Unlock"}
+                          </button>
+                        </form>
+                      {:else if transferFoldersLoading}
+                        <p class="move-empty">Loading…</p>
+                      {:else if transferError}
+                        <p class="t-error">{transferError}</p>
+                      {:else}
+                        <ul class="move-list">
+                          <li>
+                            <button
+                              type="button"
+                              class="move-item"
+                              role="menuitem"
+                              onclick={() => chooseTargetFolder("")}
+                            >
+                              <span class="move-item-label">(vault root)</span>
+                            </button>
+                          </li>
+                          {#each transferFolders as f (f)}
+                            <li>
+                              <button
+                                type="button"
+                                class="move-item"
+                                role="menuitem"
+                                style:padding-left="{8 +
+                                  f.split('/').length * 12}px"
+                                onclick={() => chooseTargetFolder(f)}
+                              >
+                                <span class="move-item-label">{f}</span>
+                              </button>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                    {:else if moveView === "confirm"}
+                      <div class="move-subhead">
+                        <button
+                          type="button"
+                          class="back-btn"
+                          aria-label="Back to folder list"
+                          onclick={() => (moveView = "vault-folders")}>‹</button
+                        >
+                        <span class="move-subhead-title">Confirm move</span>
+                      </div>
+                      <div class="t-confirm">
+                        <p class="t-confirm-text">
+                          Move to <strong>{transferTarget?.name}</strong>? The
+                          original will be moved to this vault's trash.
+                        </p>
+                        {#if transferDestFolder}
+                          <p class="t-dest">Into: {transferDestFolder}</p>
+                        {/if}
+                        {#if showPlaintextWarning}
+                          <p class="t-warn">
+                            Original remains in the OS Trash in plain text — empty
+                            the Trash to fully remove it.
+                          </p>
+                        {/if}
+                        {#if transferError}
+                          <p class="t-error">{transferError}</p>
+                        {/if}
+                        <div class="trash-confirm-actions">
                           <button
                             type="button"
-                            class="move-item"
-                            class:active={i === moveActiveIndex}
-                            class:current={opt.disabled}
-                            role="menuitem"
-                            disabled={opt.disabled}
-                            style:padding-left="{8 + opt.depth * 12}px"
-                            onmouseenter={() => (moveActiveIndex = i)}
-                            onclick={() => moveTo(opt.path)}
+                            class="confirm-btn primary"
+                            disabled={transferBusy}
+                            onclick={doTransfer}
                           >
-                            <span class="move-item-label">{opt.label}</span>
-                            {#if opt.disabled}
-                              <span class="move-item-hint">current</span>
-                            {/if}
+                            {transferBusy ? "Moving…" : "Move"}
                           </button>
-                        </li>
-                      {:else}
-                        <li class="move-empty">No folders match</li>
-                      {/each}
-                    </ul>
+                          <button
+                            type="button"
+                            class="confirm-btn"
+                            disabled={transferBusy}
+                            onclick={() => (moveView = "vault-folders")}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    {/if}
                   </div>
                 {/if}
               </div>
@@ -570,6 +957,7 @@
 
 <style>
   .editor-pane {
+    position: relative;
     flex: 1;
     height: 100%;
     display: flex;
@@ -577,6 +965,23 @@
     justify-content: center;
     background-color: var(--bg-panel);
     overflow: hidden;
+  }
+
+  /* Transient "Moved to <vault>" confirmation after a cross-vault transfer. */
+  .moved-notice {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1200;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background-color: var(--bg-panel);
+    color: var(--text);
+    font-size: 12px;
+    font-family: var(--font-ui);
+    box-shadow: var(--shadow-menu);
   }
 
   .editor-pane.has-note {
@@ -830,6 +1235,183 @@
     font-size: 12px;
     color: var(--text-muted);
     text-align: center;
+  }
+
+  /* ---- Transfer to another vault (steps inside the move popover) ---- */
+  .move-sep {
+    height: 1px;
+    margin: 6px 4px;
+    background-color: var(--border);
+  }
+
+  .move-section-label {
+    margin: 2px 0 4px;
+    padding: 0 8px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .vault-glyph {
+    flex-shrink: 0;
+    font-size: 13px;
+    line-height: 1;
+  }
+
+  .vault-row {
+    gap: 8px;
+  }
+
+  .vault-chevron {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    font-size: 15px;
+  }
+
+  .move-subhead {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px 6px;
+  }
+
+  .back-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .back-btn:hover {
+    background-color: var(--hover);
+    color: var(--text);
+  }
+
+  .move-subhead-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .t-unlock {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px;
+  }
+
+  .t-unlock-hint {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .t-remember {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .t-error {
+    margin: 0;
+    padding: 4px 4px 0;
+    font-size: 12px;
+    color: var(--danger);
+  }
+
+  .t-confirm {
+    padding: 4px;
+  }
+
+  .t-confirm-text {
+    margin: 0 0 6px;
+    font-size: 13px;
+    color: var(--text);
+    line-height: 1.4;
+  }
+
+  .t-dest {
+    margin: 0 0 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .t-warn {
+    margin: 0 0 8px;
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+
+  .confirm-btn.primary {
+    border-color: var(--accent);
+    background-color: var(--accent);
+    color: var(--accent-contrast);
+  }
+
+  .confirm-btn.primary:hover:not(:disabled) {
+    background-color: var(--accent-hover);
+  }
+
+  .confirm-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  /* ---- Dimmed folder path above the title (Job B) ---- */
+  .note-title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .note-path {
+    align-self: flex-start;
+    max-width: 100%;
+    margin: 0 0 1px;
+    padding: 0 2px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    line-height: 1.3;
+    text-align: left;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .note-path:hover {
+    color: var(--text);
+  }
+
+  .note-path-sep {
+    margin: 0 3px;
+    opacity: 0.6;
   }
 
   /* The bare "+ Add properties" affordance stays out of the way until the

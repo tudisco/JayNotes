@@ -661,6 +661,60 @@ export async function moveNote(
   notifyNoteSaved();
 }
 
+/**
+ * Transfers the note at `notePath` into another vault (`destVaultId`) under
+ * `destFolder` (relative, "" = destination root). The original is moved to the
+ * source vault's trash. Returns the note's new path in the destination.
+ *
+ * Throws `"dest-locked"` when the destination is a locked encrypted vault (the
+ * caller unlocks it via `unlockTransferDest` and retries) or a collision message
+ * when a note of that name already exists there — in both cases nothing changed.
+ * On success the note has left this vault, so if it was open its selection is
+ * cleared and the tree/recency views refresh.
+ */
+export async function transferNote(
+  notePath: string,
+  destVaultId: string,
+  destFolder: string,
+): Promise<string> {
+  const rel = await invoke<string>("transfer_note", {
+    notePath,
+    destVaultId,
+    destFolder,
+  });
+  const sel = get(selected);
+  if (sel && (sel.path === notePath || sel.path.startsWith(notePath + "/"))) {
+    selected.set(null);
+  }
+  await refreshTree();
+  notifyNoteSaved();
+  return rel;
+}
+
+/** Lists a (ready) destination vault's folder paths for the transfer picker. */
+export function listVaultFolders(id: string): Promise<string[]> {
+  return invoke<string[]>("list_vault_folders", { id });
+}
+
+/**
+ * Unlocks a transfer *destination* vault in place — caching its key so it can
+ * receive a note — WITHOUT switching the active vault away from the source.
+ * `extra` carries provider-specific fields (encrypted-files' `password2`).
+ */
+export async function unlockTransferDest(
+  id: string,
+  password: string,
+  remember: boolean,
+  extra?: Record<string, string>,
+): Promise<void> {
+  await invoke("unlock_transfer_dest", {
+    id,
+    password,
+    extra: extra ?? null,
+    remember,
+  });
+}
+
 /** Moves `node` to the OS Trash (backend never hard-deletes). */
 export async function deleteToTrash(node: TreeNode): Promise<void> {
   await invoke("trash_path", { relPath: node.path });
