@@ -284,6 +284,52 @@ pub fn try_auto_open(
     false
 }
 
+/// Opens a **temporary secondary handle** for a vault that is *not* the active
+/// one, for a cross-vault transfer (see [`crate::transfer`]) or to list its
+/// folders. The active backend in `state` is left untouched; the returned handle
+/// is dropped by the caller when it is done (an encrypted-db handle flushes its
+/// snapshot on drop).
+///
+/// - **plain** opens directly (no secret needed).
+/// - **encrypted** kinds open only from an already-unlocked session or a
+///   remembered keyring key; when neither exists the vault is locked and this
+///   returns the sentinel error `"dest-locked"` so the caller can prompt an
+///   unlock and retry.
+/// - **tinylord** and any kind whose provider is compiled out are rejected with
+///   a clear message (a hosted vault would need its full realtime runtime spun
+///   up just to accept one note, which isn't supported as a transfer target).
+pub fn open_secondary_handle(
+    app: &tauri::AppHandle,
+    vault: &crate::vault::Vault,
+) -> Result<Box<dyn VaultHandle>, String> {
+    match vault.kind {
+        crate::vault::VaultKind::Plain => {
+            let root = std::path::Path::new(&vault.path);
+            if !root.is_dir() {
+                return Err(format!(
+                    "Vault '{}' is not reachable — is the drive connected?",
+                    vault.name
+                ));
+            }
+            let canonical = root
+                .canonicalize()
+                .map_err(|e| format!("Could not resolve vault directory: {e}"))?;
+            Ok(Box::new(plain::PlainHandle::new(&canonical)))
+        }
+        #[cfg(feature = "provider-encrypted-db")]
+        crate::vault::VaultKind::EncryptedDb => encrypted_db::open_secondary(app, vault),
+        #[cfg(feature = "provider-encrypted-files")]
+        crate::vault::VaultKind::EncryptedFiles => encrypted_files::open_secondary(app, vault),
+        _ => {
+            let _ = app;
+            Err(format!(
+                "'{}' can't receive transferred notes — its vault type isn't supported as a destination.",
+                vault.name
+            ))
+        }
+    }
+}
+
 /// Opens the active vault's backend on startup: a plain vault always opens; a
 /// non-plain vault opens only if it can be unlocked silently (session/keyring),
 /// otherwise it stays locked for the UI to prompt. Best-effort — failures leave

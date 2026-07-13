@@ -2,6 +2,7 @@ mod ai;
 mod index;
 mod pdf;
 mod providers;
+mod transfer;
 mod vault;
 mod vaults;
 mod watcher;
@@ -79,6 +80,10 @@ pub fn run() {
             vault::resolve_note,
             vault::resolve_or_create_note,
             vault::reveal_in_finder,
+            transfer::transfer_note,
+            transfer::list_vault_folders,
+            #[cfg(feature = "encryption")]
+            transfer::unlock_transfer_dest,
             pdf::export_note_pdf,
             index::reindex_vault,
             index::index_status,

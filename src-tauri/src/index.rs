@@ -339,6 +339,105 @@ pub fn extract_links(body: &str) -> Vec<String> {
     out
 }
 
+/// Extracts vault-relative attachment/link targets from a note body — the
+/// `target` inside a Markdown `![alt](target)` image or `[text](target)` link.
+///
+/// Fence-aware in the same way as [`extract_inline_tags`]: targets inside fenced
+/// code blocks (``` / ~~~) and inline `` `code` `` spans are ignored so an
+/// example link in a snippet is never treated as a real reference. Only
+/// *vault-relative* targets are kept — anything with a URL scheme (`http://`,
+/// `data:`, `mailto:`), an absolute path (`/…`), or a bare `#anchor` is dropped,
+/// since those don't point at a file inside the vault. Angle-bracketed
+/// (`<path with spaces>`) targets are unwrapped and a trailing `"title"` is
+/// stripped. Targets are returned **verbatim** (still possibly percent-encoded)
+/// and deduped in first-seen order, so a caller can string-replace the exact
+/// token it found when rewriting a link.
+pub fn extract_attachment_refs(body: &str) -> Vec<String> {
+    // Reuse the fence/inline-code stripping so code samples don't contribute.
+    let mut scanned: Vec<String> = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.split('\n') {
+        let line = strip_cr(line);
+        let marker = fence_marker(line);
+        if let Some((fc, flen)) = fence {
+            if let Some((mc, ml)) = marker {
+                if mc == fc && ml >= flen {
+                    fence = None;
+                }
+            }
+            continue;
+        }
+        if let Some(m) = marker {
+            fence = Some(m);
+            continue;
+        }
+        scanned.push(strip_inline_code(line));
+    }
+
+    let text = scanned.join("\n");
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        // A link/image target opens at `](` (the `[label]` came just before).
+        if chars[i] == ']' && chars[i + 1] == '(' {
+            let mut j = i + 2;
+            let target: String;
+            if j < chars.len() && chars[j] == '<' {
+                // Angle-bracketed target: everything up to the closing `>`.
+                j += 1;
+                let start = j;
+                while j < chars.len() && chars[j] != '>' && chars[j] != '\n' {
+                    j += 1;
+                }
+                target = chars[start..j].iter().collect();
+            } else {
+                // Bare target: up to the first whitespace (title) or `)`.
+                let start = j;
+                while j < chars.len()
+                    && chars[j] != ')'
+                    && chars[j] != '\n'
+                    && !chars[j].is_whitespace()
+                {
+                    j += 1;
+                }
+                target = chars[start..j].iter().collect();
+            }
+            let t = target.trim();
+            if is_vault_relative_ref(t) && seen.insert(t.to_string()) {
+                out.push(t.to_string());
+            }
+            // Advance past whatever we consumed; the outer loop keeps scanning.
+            i = j.max(i + 2);
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// True when a Markdown link target points at a file *inside* the vault (as
+/// opposed to an external URL, an absolute path, or a bare page anchor).
+fn is_vault_relative_ref(t: &str) -> bool {
+    if t.is_empty() || t.starts_with('#') || t.starts_with('/') || t.starts_with('~') {
+        return false;
+    }
+    // A URL scheme like `http:`, `https:`, `data:`, `mailto:`, `tel:` — a run of
+    // scheme chars followed by `:` before any slash — is external.
+    if let Some(colon) = t.find(':') {
+        let scheme = &t[..colon];
+        if !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Full per-file extraction from raw note content.
 pub fn extract(raw: &str) -> Extracted {
     let (frontmatter, body) = split_frontmatter(raw);
@@ -1615,6 +1714,44 @@ Duplicate #alpha stays once.";
                     Broken [[unterminated and [[  Spaced  ]] end.";
         let links = extract_links(body);
         assert_eq!(links, vec!["Note One", "folder/Note Two", "Spaced"]);
+    }
+
+    #[test]
+    fn attachment_ref_extraction() {
+        let body = "\
+An image ![alt](attachments/one.png) and a [link](attachments/two.pdf).
+An external ![x](https://example.com/z.png) and absolute ![y](/etc/passwd).
+An anchor [top](#heading) and mail [me](mailto:a@b.com) are skipped.
+Angle ![sp](<attachments/my photo.png>) and titled ![t](attachments/three.png \"a title\").
+Dup ![alt](attachments/one.png) is not repeated.
+";
+        let refs = extract_attachment_refs(body);
+        assert_eq!(
+            refs,
+            vec![
+                "attachments/one.png",
+                "attachments/two.pdf",
+                "attachments/my photo.png",
+                "attachments/three.png",
+            ]
+        );
+    }
+
+    #[test]
+    fn attachment_refs_ignore_fenced_and_inline_code() {
+        let body = "\
+Real ![a](attachments/real.png).
+`![c](attachments/inline.png)` stays out.
+```
+![f](attachments/fenced.png)
+```
+Also real ![b](attachments/real2.png).
+";
+        let refs = extract_attachment_refs(body);
+        assert_eq!(
+            refs,
+            vec!["attachments/real.png", "attachments/real2.png"]
+        );
     }
 
     #[test]

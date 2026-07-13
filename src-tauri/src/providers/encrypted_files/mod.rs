@@ -632,6 +632,37 @@ fn open_and_activate(
     Ok(())
 }
 
+/// Opens a **temporary secondary handle** for a cross-vault transfer (see
+/// [`crate::transfer`]) using an already-unlocked session or remembered keyring
+/// material — never prompting. A locked vault is signalled by the sentinel error
+/// `"dest-locked"`. The handle is built over a throwaway (empty) index so its
+/// open-time reindex never clobbers the *active* vault's shared `state.index`;
+/// the destination's own search index simply refreshes on its next real open.
+pub fn open_secondary(
+    app: &tauri::AppHandle,
+    vault: &Vault,
+) -> Result<Box<dyn VaultHandle>, String> {
+    let backing = PathBuf::from(&vault.path);
+    if !backing.is_dir() {
+        return Err(format!("Vault folder is missing: {}", vault.path));
+    }
+    let session = app.state::<SecretsSession>();
+    let material = session
+        .get_bytes(&vault.id)
+        .or_else(|| crypto::keyring_get_bytes(&vault.id))
+        .ok_or_else(|| "dest-locked".to_string())?;
+    let cipher = CryptCipher::from_material(&material)?;
+    verify_key(&backing, &cipher)?;
+    let cipher = Arc::new(cipher);
+    // Throwaway index + recent-writes maps: writes into the destination must not
+    // reach into the active vault's live index or its watcher suppression set.
+    let scratch_index: Arc<Mutex<Option<Index>>> = Arc::new(Mutex::new(None));
+    let scratch_recent = Arc::new(Mutex::new(HashMap::new()));
+    let handle =
+        EncryptedFilesHandle::open_at(&backing, cipher, scratch_index, scratch_recent)?;
+    Ok(Box::new(handle))
+}
+
 /// Attempts to open the vault automatically from an already-unlocked session or
 /// remembered keyring material. Never prompts. Returns true on success.
 pub fn auto_open(app: &tauri::AppHandle, state: &AppState, vault: &Vault) -> bool {
@@ -665,6 +696,32 @@ pub fn unlock_with_password(
     let cipher = CryptCipher::derive(password, password2)?;
     let material = cipher.key_material().to_vec();
     open_and_activate(app, state, vault, cipher)?;
+    session.store_bytes(&vault.id, material.clone());
+    if remember {
+        let _ = crypto::keyring_store_bytes(&vault.id, &material);
+    }
+    Ok(())
+}
+
+/// Unlocks a vault into the [`SecretsSession`] **only** — deriving and verifying
+/// the key material without installing the vault as the active backend. Used to
+/// unlock a *transfer destination* in place while the source vault stays active.
+pub fn unlock_session_only(
+    app: &tauri::AppHandle,
+    session: &SecretsSession,
+    vault: &Vault,
+    password: &str,
+    password2: &str,
+    remember: bool,
+) -> Result<(), String> {
+    let _ = app;
+    let backing = PathBuf::from(&vault.path);
+    if !backing.is_dir() {
+        return Err(format!("Vault folder is missing: {}", vault.path));
+    }
+    let cipher = CryptCipher::derive(password, password2)?;
+    verify_key(&backing, &cipher)?; // wrong password → probe fails
+    let material = cipher.key_material().to_vec();
     session.store_bytes(&vault.id, material.clone());
     if remember {
         let _ = crypto::keyring_store_bytes(&vault.id, &material);

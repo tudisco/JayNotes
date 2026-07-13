@@ -85,7 +85,7 @@ pub struct EncryptedDbHandle {
 }
 
 impl EncryptedDbHandle {
-    fn new(container: Container, snapshot: PathBuf) -> Self {
+    pub(crate) fn new(container: Container, snapshot: PathBuf) -> Self {
         let container = Arc::new(Mutex::new(container));
         let (tx, rx) = channel::<()>();
         let worker = spawn_snapshot_worker(container.clone(), snapshot, rx);
@@ -264,14 +264,15 @@ fn sync_conflict_siblings(snapshot: &Path) -> Vec<PathBuf> {
 }
 
 /// Opens (hydrating + importing as needed) an encrypted-db vault with `key`,
-/// installs it as the active backend, and returns. A wrong key surfaces as an
-/// error from [`Container::open`].
-fn open_and_activate(
+/// returning a ready [`EncryptedDbHandle`] **without** touching shared state. A
+/// wrong key surfaces as an error from [`Container::open`]. Used both by
+/// [`open_and_activate`] (which then installs it as the active backend) and by
+/// [`open_secondary`] (a temporary handle for a cross-vault transfer).
+fn open_handle(
     app: &tauri::AppHandle,
-    state: &AppState,
     vault: &Vault,
     key: [u8; 32],
-) -> Result<(), String> {
+) -> Result<EncryptedDbHandle, String> {
     let snapshot = PathBuf::from(&vault.path);
     let live = live_db_path(app, &vault.id)?;
     if let Some(parent) = live.parent() {
@@ -305,11 +306,41 @@ fn open_and_activate(
         container.export_snapshot(&snapshot)?; // re-export the merged state
     }
 
+    Ok(EncryptedDbHandle::new(container, snapshot))
+}
+
+/// Opens an encrypted-db vault with `key` and installs it as the active backend.
+fn open_and_activate(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    vault: &Vault,
+    key: [u8; 32],
+) -> Result<(), String> {
+    let handle = open_handle(app, vault, key)?;
     // Encrypted vaults have no plain fs index/watcher; the container is both.
     *state.index.lock().unwrap() = None;
     *state.watcher.lock().unwrap() = None;
-    *state.active.lock().unwrap() = Some(Box::new(EncryptedDbHandle::new(container, snapshot)));
+    *state.active.lock().unwrap() = Some(Box::new(handle));
     Ok(())
+}
+
+/// Opens a **temporary secondary handle** for a cross-vault transfer (see
+/// [`crate::transfer`]) using an already-unlocked session key or a remembered
+/// keyring key — never prompting. When neither is available the vault is locked,
+/// signalled by the sentinel error `"dest-locked"` so the frontend can prompt
+/// the user to unlock it and retry. The returned handle is dropped by the caller
+/// after the transfer, at which point its `Drop` flushes a final snapshot.
+pub fn open_secondary(
+    app: &tauri::AppHandle,
+    vault: &Vault,
+) -> Result<Box<dyn VaultHandle>, String> {
+    let session = app.state::<SecretsSession>();
+    let key = session
+        .get(&vault.id)
+        .or_else(|| crypto::keyring_get(&vault.id))
+        .ok_or_else(|| "dest-locked".to_string())?;
+    let handle = open_handle(app, vault, key)?;
+    Ok(Box::new(handle))
 }
 
 /// Attempts to open the vault automatically using an already-unlocked session
@@ -436,6 +467,35 @@ pub fn unlock_with_password(
     let key = crypto::derive_vault_key(password, &salt)?;
 
     open_and_activate(app, state, vault, key)?;
+    session.store(&vault.id, key);
+    if remember {
+        let _ = crypto::keyring_store(&vault.id, &key);
+    }
+    Ok(())
+}
+
+/// Unlocks a vault into the [`SecretsSession`] **only** — deriving and verifying
+/// the key without installing the vault as the active backend. Used to unlock a
+/// *transfer destination* in place (the active/source vault must stay active).
+/// On success the key is cached in the session and, if `remember`, the keyring.
+pub fn unlock_session_only(
+    app: &tauri::AppHandle,
+    session: &SecretsSession,
+    vault: &Vault,
+    password: &str,
+    remember: bool,
+) -> Result<(), String> {
+    let salt_hex = vault
+        .config
+        .get("salt")
+        .and_then(|v| v.as_str())
+        .ok_or("Vault is missing its key salt")?;
+    let salt = crypto::from_hex(salt_hex)?;
+    let key = crypto::derive_vault_key(password, &salt)?;
+    // Opening the container verifies the key (wrong password → SQLCipher error);
+    // the handle is dropped immediately (no writes → no snapshot export).
+    let handle = open_handle(app, vault, key)?;
+    drop(handle);
     session.store(&vault.id, key);
     if remember {
         let _ = crypto::keyring_store(&vault.id, &key);
