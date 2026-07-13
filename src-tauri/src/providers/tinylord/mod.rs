@@ -101,6 +101,12 @@ impl VaultProvider for TinylordProvider {
             display_name: "TinyLord server".into(),
             description: "Notes hosted on your TinyLord server, live-synced across devices.".into(),
             config_fields: vec![
+                // A display name for the vault list. Unlike folder-backed
+                // providers, a hosted vault has no folder basename to derive a
+                // name from, so it must be asked for explicitly (it falls back
+                // to "<database> @ <host>" if left blank — see
+                // `create_tinylord_vault`).
+                field("name", "Vault name", "text", true, "My server vault"),
                 field("url", "Server URL", "url", true, "https://notes.example.com"),
                 field("database", "Database", "text", true, "jaynotes").with_default("jaynotes"),
                 field("username", "Username", "text", true, "your-username"),
@@ -1008,6 +1014,43 @@ where
     std::thread::scope(|s| s.spawn(|| rt.block_on(fut)).join().unwrap())
 }
 
+/// Owns a freshly-built [`Runtime`] until it is [`take`](RtGuard::take)n into a
+/// handle. If it is instead dropped — i.e. an early `?`/error return before the
+/// handle is assembled — it shuts the runtime down **in the background** rather
+/// than inline.
+///
+/// This matters because `open_and_activate`/`open_connect_only` run *inside* an
+/// async Tauri command (the create/unlock commands are `async`, so their bodies
+/// execute on Tauri's tokio runtime). Dropping a `Runtime` from within an async
+/// context panics ("Cannot drop a runtime in a context where blocking is not
+/// allowed"), and a panic in an async command is never turned into a rejected
+/// IPC promise — the frontend would hang forever (the original "Creating…"
+/// bug). Deferring the shutdown off-thread keeps every error path returning a
+/// clean `Err` instead. Mirrors [`TinyLordHandle::drop`].
+struct RtGuard(Option<Runtime>);
+
+impl RtGuard {
+    fn new(rt: Runtime) -> Self {
+        RtGuard(Some(rt))
+    }
+    /// Borrows the runtime for `block_on_rt`/`spawn`.
+    fn rt(&self) -> &Runtime {
+        self.0.as_ref().expect("runtime present")
+    }
+    /// Disarms the guard, yielding the runtime to be moved into the handle.
+    fn take(mut self) -> Runtime {
+        self.0.take().expect("runtime present")
+    }
+}
+
+impl Drop for RtGuard {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
 /// A stable index-file key for a vault (URL + database).
 fn index_key(vault: &Vault, database: &str) -> String {
     format!("tinylord:{}:{}", client::normalize_base(&vault.path), database)
@@ -1031,19 +1074,24 @@ fn open_and_activate(
         .unwrap_or("jaynotes")
         .to_string();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Could not start network runtime: {e}"))?;
+    // Held in an `RtGuard`: any error return below shuts the runtime down
+    // off-thread instead of dropping it inline in this async context (which
+    // would panic and leave the create/unlock IPC promise unresolved forever).
+    let rt = RtGuard::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Could not start network runtime: {e}"))?,
+    );
 
     // Log in (verifies credentials). A wrong password / unreachable server errors.
-    let client = block_on_rt(&rt, TinyClient::login(&base, &database, username, password))
+    let client = block_on_rt(rt.rt(), TinyClient::login(&base, &database, username, password))
         .map_err(String::from)?;
 
     // Best-effort: ensure a path index exists on each collection (needs the
     // per-db admin grant; a plain write user's 403 is swallowed inside).
-    block_on_rt(&rt, async {
+    block_on_rt(rt.rt(), async {
         client.ensure_path_index(NOTES).await;
         client.ensure_path_index(FOLDERS).await;
         client.ensure_path_index(ATTACHMENTS).await;
@@ -1055,7 +1103,7 @@ fn open_and_activate(
 
     // Initial full sync.
     let maps = Arc::new(Mutex::new(Maps::default()));
-    let sync = match block_on_rt(&rt, sync_all(&client)) {
+    let sync = match block_on_rt(rt.rt(), sync_all(&client)) {
         Ok(v) => v,
         Err(e) => {
             *state.index.lock().unwrap() = None;
@@ -1063,6 +1111,9 @@ fn open_and_activate(
         }
     };
     apply_full_sync(&state.index, &maps, sync);
+
+    // All fallible work done: take the runtime for the handle (disarms the guard).
+    let rt = rt.take();
 
     // Spawn the realtime subscribers.
     let client = Arc::new(client);
@@ -1143,19 +1194,24 @@ fn open_connect_only(
         .to_string();
 
     // A current-thread runtime: no SSE tasks run on it, so a single reactor
-    // thread driving one blocking bridge call at a time is all we need.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Could not start network runtime: {e}"))?;
+    // thread driving one blocking bridge call at a time is all we need. Wrapped
+    // in an `RtGuard` so a login/sync error shuts it down off-thread rather than
+    // dropping it inline in this async context (which would panic — see
+    // `RtGuard`).
+    let rt = RtGuard::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Could not start network runtime: {e}"))?,
+    );
 
-    let client = block_on_rt(&rt, TinyClient::login(&base, &database, username, password))
+    let client = block_on_rt(rt.rt(), TinyClient::login(&base, &database, username, password))
         .map_err(String::from)?;
-    let maps = block_on_rt(&rt, sync_paths_only(&client)).map_err(String::from)?;
+    let maps = block_on_rt(rt.rt(), sync_paths_only(&client)).map_err(String::from)?;
 
     Ok(TinyLordHandle {
         client: Arc::new(client),
-        rt: Some(rt),
+        rt: Some(rt.take()),
         maps: Arc::new(Mutex::new(maps)),
         // Connect-only: no local FTS mirror, no realtime tasks.
         index: Arc::new(Mutex::new(None)),
@@ -1282,6 +1338,7 @@ pub async fn create_tinylord_vault(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     session: tauri::State<'_, TinyLordSessions>,
+    name: String,
     url: String,
     database: String,
     username: String,
@@ -1307,13 +1364,20 @@ pub async fn create_tinylord_vault(
     let mut settings = load_settings(&app)?;
     let id = new_id();
     let host = base.split("://").nth(1).unwrap_or(&base);
-    let default_name = format!("{database} @ {host}");
+    // Use the given name; fall back to "<database> @ <host>" when left blank,
+    // since a hosted vault has no folder basename to derive one from.
+    let name = name.trim();
+    let display_name = if name.is_empty() {
+        format!("{database} @ {host}")
+    } else {
+        name.to_string()
+    };
     let mut config = serde_json::Map::new();
     config.insert("database".into(), serde_json::Value::String(database.clone()));
     config.insert("username".into(), serde_json::Value::String(username.clone()));
     let vault = Vault {
         id: id.clone(),
-        name: dedup_name(&default_name, &settings.vaults),
+        name: dedup_name(&display_name, &settings.vaults),
         path: base,
         kind: VaultKind::Tinylord,
         config,

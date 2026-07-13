@@ -28,7 +28,16 @@ use serde::Deserialize;
 
 /// Timeout for every non-streaming request. Kept off the SSE subscribe stream
 /// (which is long-lived) by setting it per-request rather than on the client.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on the connection (DNS + TCP + TLS) phase for **every** request,
+/// including the long-lived SSE `subscribe` stream. Set on the client builder
+/// rather than per-request so it applies to the subscribe stream too — the
+/// stream must never carry a full request timeout (it stays open by design),
+/// but it must still fail fast when the server is unreachable rather than
+/// hanging on a dead connect. A tunneled/unreachable host now errors within
+/// this bound instead of stalling indefinitely.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default/maximum page size for `query` pagination (TinyLord clamps to its
 /// configured `max_query_limit`, default 500).
@@ -154,7 +163,14 @@ impl TinyClient {
         password: &str,
     ) -> Result<TinyClient, TinyError> {
         let base = normalize_base(base_url);
+        // `connect_timeout` on the builder bounds the connect phase of every
+        // request made with this client — non-streaming calls AND the SSE
+        // subscribe stream — so an unreachable server fails fast. A full
+        // request `timeout` is deliberately NOT set on the builder (it would
+        // kill the long-lived subscribe stream); non-streaming calls set it
+        // per-request instead (see `login`/`refresh`/`send`).
         let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(network)?;
 

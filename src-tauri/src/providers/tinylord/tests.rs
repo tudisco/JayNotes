@@ -34,10 +34,15 @@ fn provider_metadata_shape() {
     assert_eq!(meta.unlock_label.as_deref(), Some("Sign in"));
 
     let keys: Vec<&str> = meta.config_fields.iter().map(|f| f.key.as_str()).collect();
-    assert_eq!(keys, vec!["url", "database", "username", "password"]);
-    let db_field = &meta.config_fields[1];
+    assert_eq!(keys, vec!["name", "url", "database", "username", "password"]);
+    // The name field is required (a hosted vault has no folder basename to
+    // derive a display name from).
+    let name_field = &meta.config_fields[0];
+    assert_eq!(name_field.field_type, "text");
+    assert!(name_field.required);
+    let db_field = &meta.config_fields[2];
     assert_eq!(db_field.default.as_deref(), Some("jaynotes"));
-    assert_eq!(meta.config_fields[3].field_type, "password");
+    assert_eq!(meta.config_fields[4].field_type, "password");
 }
 
 #[test]
@@ -697,6 +702,33 @@ fn transfer_temp_dir(tag: &str) -> std::path::PathBuf {
 /// a `find_by_path` miss).
 fn empty_query() -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({ "items": [], "next_cursor": null }))
+}
+
+/// Regression for the "Creating…" hang: opening a vault whose server is
+/// unreachable must return a clean `Err` even when called from **inside an
+/// async runtime** (as the `async` create/unlock Tauri commands do). Before the
+/// fix, the freshly-built tokio `Runtime` was dropped inline on the error `?`,
+/// and dropping a runtime within an async context panics — which, in an async
+/// Tauri command, leaves the IPC promise unresolved forever (the eternal
+/// spinner). The `RtGuard` now shuts the runtime down off-thread instead, so
+/// this returns `Err` rather than panicking.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_connect_only_errors_without_panicking_in_async_context() {
+    // Called directly in the async body, exactly as the `async` create/unlock
+    // Tauri commands call it: the inner runtime is thus built and (on error)
+    // dropped while this future is being polled on a runtime worker — the exact
+    // condition under which an inline runtime drop panics. Port 1 refuses
+    // instantly → a fast, deterministic connect failure.
+    let vault = tinylord_vault("http://127.0.0.1:1");
+    // `TinyLordHandle` has no `Debug`, so match rather than `expect_err`.
+    let err = match super::open_connect_only(&vault, "jay", "pw") {
+        Ok(_) => panic!("unreachable server must error"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("unreachable") || err.contains("TinyLord"),
+        "expected a network error, got: {err}"
+    );
 }
 
 /// With no remembered password the destination is locked — the app-free core of

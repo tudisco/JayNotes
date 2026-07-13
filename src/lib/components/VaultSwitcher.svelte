@@ -195,6 +195,7 @@
         );
       } else if (p.kind === "tinylord") {
         await createTinylordVault(
+          configValues.name,
           configValues.url,
           configValues.database,
           configValues.username,
@@ -207,6 +208,9 @@
       close();
     } catch (e) {
       createError = String(e);
+    } finally {
+      // Always clear the busy state — even if the backend errored or the call
+      // was slow — so the button can never get stuck on "Creating…".
       creating = false;
     }
   }

@@ -370,6 +370,7 @@ export async function createEncryptedFilesVault(
  * it live. Returns the new vault id.
  */
 export async function createTinylordVault(
+  name: string,
   url: string,
   database: string,
   username: string,
@@ -377,6 +378,7 @@ export async function createTinylordVault(
   remember: boolean,
 ): Promise<string> {
   const vault = await invoke<VaultInfo>("create_tinylord_vault", {
+    name,
     url,
     database,
     username,
