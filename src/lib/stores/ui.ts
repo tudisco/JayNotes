@@ -67,3 +67,35 @@ export function toggleChat(): void {
  * input; the value itself is meaningless.
  */
 export const searchFocusNonce = writable(0);
+
+/** How wide the note editor column is. */
+export type EditorWidth = "full" | "comfortable";
+
+const EDITOR_WIDTH_KEY = "jaynotes:editorWidth";
+
+function initialEditorWidth(): EditorWidth {
+  if (typeof localStorage === "undefined") return "full";
+  return localStorage.getItem(EDITOR_WIDTH_KEY) === "comfortable"
+    ? "comfortable"
+    : "full";
+}
+
+/**
+ * Notes grow with the window by default ("full", generous side padding);
+ * "comfortable" opts into the classic centered 46rem reading column. Applied
+ * as `data-editor-width` on <html> so plain CSS switches both the editor
+ * content and the note header. Persisted across restarts.
+ */
+export const editorWidth = writable<EditorWidth>(initialEditorWidth());
+
+if (typeof localStorage !== "undefined") {
+  editorWidth.subscribe((v) => {
+    localStorage.setItem(EDITOR_WIDTH_KEY, v);
+    document.documentElement.dataset.editorWidth = v;
+  });
+}
+
+/** Flips between full-width and comfortable reading column. */
+export function toggleEditorWidth(): void {
+  editorWidth.update((v) => (v === "full" ? "comfortable" : "full"));
+}

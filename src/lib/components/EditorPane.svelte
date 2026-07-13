@@ -1023,12 +1023,20 @@
     flex-shrink: 0;
   }
 
+  /* Tracks the editor column width (see editor.css): fluid by default,
+     centered 46rem when data-editor-width="comfortable". */
   .note-header {
     display: flex;
     align-items: flex-start;
     gap: 8px;
-    max-width: 46rem;
+    max-width: none;
     width: 100%;
+    margin: 0;
+    padding: 28px 48px 4px;
+  }
+
+  :global([data-editor-width="comfortable"]) .note-header {
+    max-width: 46rem;
     margin: 0 auto;
     padding: 28px 16px 4px;
   }

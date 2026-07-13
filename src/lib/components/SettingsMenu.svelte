@@ -16,6 +16,7 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { themeMode, cycleTheme, type ThemeMode } from "$lib/stores/theme";
+  import { editorWidth, toggleEditorWidth } from "$lib/stores/ui";
   import {
     vaultError,
     vaultPath,
@@ -116,6 +117,17 @@
         <span class="menu-icon">{themeIcons[$themeMode]}</span>
         <span class="menu-label">Theme</span>
         <span class="menu-value">{themeLabels[$themeMode]}</span>
+      </button>
+
+      <button
+        type="button"
+        class="menu-item"
+        role="menuitem"
+        onclick={toggleEditorWidth}
+      >
+        <span class="menu-icon">⇔</span>
+        <span class="menu-label">Note width</span>
+        <span class="menu-value">{$editorWidth === "full" ? "Full" : "Comfortable"}</span>
       </button>
 
       <div class="separator"></div>

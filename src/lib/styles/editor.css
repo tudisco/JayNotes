@@ -45,16 +45,24 @@
   font-family: var(--font-content);
 }
 
-/* Content column: Obsidian/Notion-style comfortable centered measure. */
+/* Content column. Default: fluid — notes grow with the window behind generous
+   side padding (tables and code get room to breathe). Settings offers the
+   classic centered 46rem reading column via data-editor-width="comfortable". */
 .milkdown .ProseMirror {
-  max-width: 46rem;
-  margin: 0 auto;
-  padding: 8px 16px 40vh;
+  max-width: none;
+  margin: 0;
+  padding: 8px 48px 40vh;
   font-family: var(--font-content);
   font-size: 16px;
   line-height: 1.65;
   color: var(--text);
   caret-color: var(--accent);
+}
+
+:root[data-editor-width="comfortable"] .milkdown .ProseMirror {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 8px 16px 40vh;
 }
 
 /* The editing surface manages its own caret/selection affordance, so the
