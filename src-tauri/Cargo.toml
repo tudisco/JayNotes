@@ -1,6 +1,6 @@
 [package]
 name = "jaynotes"
-version = "0.4.0"
+version = "0.4.1"
 description = "JayNotes - a simple Obsidian-style markdown notes app"
 authors = ["Jason Tudisco"]
 edition = "2021"
