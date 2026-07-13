@@ -203,13 +203,24 @@
         } else if (v.status === "unsupported") {
           disabled = true;
           reason = "unsupported build";
-        } else if (v.kind === "tinylord") {
-          disabled = true;
-          reason = "hosted — can't receive";
         }
+        // Hosted (tinylord) vaults are valid destinations: clicking one opens a
+        // connect-only handle, falling into the inline sign-in when signed out —
+        // the same ready/locked flow as encrypted vaults.
         return { vault: v, glyph: kindGlyph[v.kind] ?? "📁", disabled, reason };
       }),
   );
+
+  // The inline transfer-unlock is "Sign in" flavored for a hosted (tinylord)
+  // vault — whose unlock is a server login — and "Unlock" for encrypted vaults.
+  let tUnlockIsLogin = $derived(transferTarget?.kind === "tinylord");
+  let tUnlockHint = $derived(
+    tUnlockIsLogin
+      ? "Sign in to this server first."
+      : "Unlock this vault first.",
+  );
+  let tUnlockVerb = $derived(tUnlockIsLogin ? "Sign in" : "Unlock");
+  let tUnlockBusyVerb = $derived(tUnlockIsLogin ? "Signing in…" : "Unlocking…");
 
   // The plaintext-Trash warning applies when moving OUT of a plain vault INTO an
   // encrypted one: the OS Trash copy of the original stays readable in the clear.
@@ -727,7 +738,7 @@
                       </div>
                       {#if unlockingTargetId}
                         <form class="t-unlock" onsubmit={submitTargetUnlock}>
-                          <p class="t-unlock-hint">Unlock this vault first.</p>
+                          <p class="t-unlock-hint">{tUnlockHint}</p>
                           <!-- svelte-ignore a11y_autofocus -->
                           <input
                             class="move-filter"
@@ -758,7 +769,7 @@
                             class="confirm-btn primary"
                             disabled={tUnlocking || !tUnlockPw}
                           >
-                            {tUnlocking ? "Unlocking…" : "Unlock"}
+                            {tUnlocking ? tUnlockBusyVerb : tUnlockVerb}
                           </button>
                         </form>
                       {:else if transferFoldersLoading}

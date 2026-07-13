@@ -97,14 +97,14 @@ pub async fn list_vault_folders(
     Ok(collect_folder_paths(&tree))
 }
 
-/// Unlocks a **transfer destination** vault in place: it caches the derived key
+/// Unlocks a **transfer destination** vault in place: it caches the credential
 /// in the unlock session so [`open_secondary_handle`] can open it, *without*
 /// making it the active backend (the source vault must stay active). Dispatches
-/// by kind like the main unlock command. Present only when an encrypted provider
-/// is compiled in.
+/// by kind like the main unlock command. Present whenever a provider that needs
+/// unlocking (encrypted or hosted `tinylord`) is compiled in.
 ///
 /// [`open_secondary_handle`]: crate::providers::open_secondary_handle
-#[cfg(feature = "encryption")]
+#[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
 #[tauri::command]
 pub async fn unlock_transfer_dest(
     app: tauri::AppHandle,
@@ -113,8 +113,9 @@ pub async fn unlock_transfer_dest(
     extra: Option<std::collections::HashMap<String, String>>,
     remember: bool,
 ) -> Result<(), String> {
-    use crate::providers::crypto::SecretsSession;
+    #[allow(unused_imports)]
     use crate::vault::VaultKind;
+    #[allow(unused_imports)]
     use tauri::Manager;
 
     let settings = load_settings(&app)?;
@@ -124,14 +125,18 @@ pub async fn unlock_transfer_dest(
         .find(|v| v.id == id)
         .ok_or("No such vault")?
         .clone();
-    let session = app.state::<SecretsSession>();
+    let _ = (&app, &password, &extra, remember);
     match vault.kind {
         #[cfg(feature = "provider-encrypted-db")]
-        VaultKind::EncryptedDb => crate::providers::encrypted_db::unlock_session_only(
-            &app, &session, &vault, &password, remember,
-        ),
+        VaultKind::EncryptedDb => {
+            let session = app.state::<crate::providers::crypto::SecretsSession>();
+            crate::providers::encrypted_db::unlock_session_only(
+                &app, &session, &vault, &password, remember,
+            )
+        }
         #[cfg(feature = "provider-encrypted-files")]
         VaultKind::EncryptedFiles => {
+            let session = app.state::<crate::providers::crypto::SecretsSession>();
             let password2 = extra
                 .as_ref()
                 .and_then(|m| m.get("password2"))
@@ -141,10 +146,30 @@ pub async fn unlock_transfer_dest(
                 &app, &session, &vault, &password, &password2, remember,
             )
         }
-        _ => {
-            let _ = &extra;
-            Err("This vault type can't be unlocked as a transfer destination".into())
+        #[cfg(feature = "provider-tinylord")]
+        VaultKind::Tinylord => {
+            // Username: an explicit `extra` field wins; otherwise the one stored
+            // in the vault's config at creation (the common case — the transfer
+            // unlock panel only asks for the password).
+            let username = extra
+                .as_ref()
+                .and_then(|m| m.get("username"))
+                .cloned()
+                .filter(|u| !u.trim().is_empty())
+                .or_else(|| {
+                    vault
+                        .config
+                        .get("username")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let session = app.state::<crate::providers::tinylord::TinyLordSessions>();
+            crate::providers::tinylord::unlock_session_only(
+                &session, &vault, &username, &password, remember,
+            )
         }
+        _ => Err("This vault type can't be unlocked as a transfer destination".into()),
     }
 }
 

@@ -1103,6 +1103,130 @@ fn open_and_activate(
     Ok(())
 }
 
+/// Queries just the `path` field of every note/folder/attachment document and
+/// builds the id maps from them — a *connect-only* seed used by
+/// [`open_connect_only`]. Unlike [`sync_all`] it transfers no note content and
+/// builds no FTS index; it only needs enough to address documents by path
+/// (collision guards, attachment uniquification) and to render the destination's
+/// folder tree in the transfer picker.
+async fn sync_paths_only(client: &TinyClient) -> Result<Maps, TinyError> {
+    let mut maps = Maps::default();
+    for (id, path) in client.query_paths(NOTES).await? {
+        maps.insert_note(&path, &id);
+    }
+    for (id, path) in client.query_paths(FOLDERS).await? {
+        maps.insert_folder(&path, &id);
+    }
+    for (id, path) in client.query_paths(ATTACHMENTS).await? {
+        maps.insert_attachment(&path, &id);
+    }
+    Ok(maps)
+}
+
+/// Builds a **connect-only** handle: logs in and seeds the path maps, but starts
+/// NO SSE subscribers, NO local FTS mirror (`index` stays `None`), and NO
+/// reconnect loop. It exists only long enough to accept documents through the
+/// handle's doc-CRUD ops during a cross-vault transfer, so it uses the cheapest
+/// correct runtime — a single-threaded reactor that drives one blocking request
+/// at a time — and holds no background tasks, making its [`Drop`] trivial.
+fn open_connect_only(
+    vault: &Vault,
+    username: &str,
+    password: &str,
+) -> Result<TinyLordHandle, String> {
+    let base = client::normalize_base(&vault.path);
+    let database = vault
+        .config
+        .get("database")
+        .and_then(|v| v.as_str())
+        .unwrap_or("jaynotes")
+        .to_string();
+
+    // A current-thread runtime: no SSE tasks run on it, so a single reactor
+    // thread driving one blocking bridge call at a time is all we need.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Could not start network runtime: {e}"))?;
+
+    let client = block_on_rt(&rt, TinyClient::login(&base, &database, username, password))
+        .map_err(String::from)?;
+    let maps = block_on_rt(&rt, sync_paths_only(&client)).map_err(String::from)?;
+
+    Ok(TinyLordHandle {
+        client: Arc::new(client),
+        rt: Some(rt),
+        maps: Arc::new(Mutex::new(maps)),
+        // Connect-only: no local FTS mirror, no realtime tasks.
+        index: Arc::new(Mutex::new(None)),
+        recent: Arc::new(Mutex::new(HashMap::new())),
+        db: database,
+        cancel: Arc::new(AtomicBool::new(false)),
+        tasks: Vec::new(),
+    })
+}
+
+/// Opens a **connect-only secondary handle** for a cross-vault transfer (see
+/// [`crate::transfer`]) using a remembered password (session or keyring), never
+/// prompting. When none is available the vault is locked, signalled by the
+/// sentinel error `"dest-locked"` so the frontend can prompt a sign-in and retry.
+///
+/// The handle carries no SSE/index runtime, so it is dropped cheaply once the
+/// transfer returns. No post-transfer sync is needed: the destination is a live
+/// server, so other devices see the new documents immediately, and if the user
+/// later switches to this vault locally, [`open_and_activate`] does a full
+/// [`sync_all`] on open.
+pub fn open_secondary(
+    app: &tauri::AppHandle,
+    vault: &Vault,
+) -> Result<Box<dyn VaultHandle>, String> {
+    let session = app.state::<TinyLordSessions>();
+    let password = session
+        .get(&vault.id)
+        .or_else(|| keyring_get_password(&vault.id));
+    open_secondary_with_password(vault, password)
+}
+
+/// The app-free core of [`open_secondary`]: builds the connect-only handle from
+/// an already-resolved password, or returns `"dest-locked"` when there is none.
+/// Split out so the locked-destination path is unit-testable without a Tauri app.
+fn open_secondary_with_password(
+    vault: &Vault,
+    password: Option<String>,
+) -> Result<Box<dyn VaultHandle>, String> {
+    let password = password.ok_or_else(|| "dest-locked".to_string())?;
+    let username = vault
+        .config
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let handle = open_connect_only(vault, &username, &password)?;
+    Ok(Box::new(handle))
+}
+
+/// Unlocks a tinylord vault into the session **only** — verifies the login by
+/// building (and immediately dropping) a connect-only handle, without installing
+/// it as the active backend, so it can serve as a transfer destination while the
+/// source vault stays active. Mirrors the encrypted providers'
+/// `unlock_session_only`. Caches the password in the session and, if `remember`,
+/// the OS keyring.
+pub fn unlock_session_only(
+    session: &TinyLordSessions,
+    vault: &Vault,
+    username: &str,
+    password: &str,
+    remember: bool,
+) -> Result<(), String> {
+    let handle = open_connect_only(vault, username, password)?;
+    drop(handle);
+    session.store(&vault.id, password);
+    if remember {
+        let _ = keyring_store_password(&vault.id, password);
+    }
+    Ok(())
+}
+
 /// Attempts to open the vault silently from a remembered password (session or
 /// keyring). Never prompts. Returns true on success.
 pub fn auto_open(app: &tauri::AppHandle, state: &AppState, vault: &Vault) -> bool {

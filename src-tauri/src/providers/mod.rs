@@ -295,9 +295,10 @@ pub fn try_auto_open(
 ///   remembered keyring key; when neither exists the vault is locked and this
 ///   returns the sentinel error `"dest-locked"` so the caller can prompt an
 ///   unlock and retry.
-/// - **tinylord** and any kind whose provider is compiled out are rejected with
-///   a clear message (a hosted vault would need its full realtime runtime spun
-///   up just to accept one note, which isn't supported as a transfer target).
+/// - **tinylord** opens a lightweight *connect-only* handle (login + path maps,
+///   no SSE/index runtime) from a remembered password, likewise returning
+///   `"dest-locked"` when signed out.
+/// - a kind whose provider is compiled out is rejected with a clear message.
 pub fn open_secondary_handle(
     app: &tauri::AppHandle,
     vault: &crate::vault::Vault,
@@ -320,6 +321,11 @@ pub fn open_secondary_handle(
         crate::vault::VaultKind::EncryptedDb => encrypted_db::open_secondary(app, vault),
         #[cfg(feature = "provider-encrypted-files")]
         crate::vault::VaultKind::EncryptedFiles => encrypted_files::open_secondary(app, vault),
+        #[cfg(feature = "provider-tinylord")]
+        crate::vault::VaultKind::Tinylord => tinylord::open_secondary(app, vault),
+        // Reachable only in a build with a provider compiled out (all-features
+        // builds cover every `VaultKind`, making this arm unreachable there).
+        #[allow(unreachable_patterns)]
         _ => {
             let _ = app;
             Err(format!(

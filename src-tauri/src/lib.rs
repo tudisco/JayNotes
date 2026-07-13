@@ -82,7 +82,7 @@ pub fn run() {
             vault::reveal_in_finder,
             transfer::transfer_note,
             transfer::list_vault_folders,
-            #[cfg(feature = "encryption")]
+            #[cfg(any(feature = "encryption", feature = "provider-tinylord"))]
             transfer::unlock_transfer_dest,
             pdf::export_note_pdf,
             index::reindex_vault,

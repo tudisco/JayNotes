@@ -659,6 +659,229 @@ async fn sse_subscribe_sends_last_event_id_header() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-vault transfer INTO a tinylord destination (connect-only handle)
+// ---------------------------------------------------------------------------
+
+use crate::providers::plain::PlainHandle;
+use crate::transfer::transfer_core;
+
+/// A tinylord destination `Vault` pointing at `url` (username in config, as it
+/// is stored at creation — the transfer unlock only supplies the password).
+fn tinylord_vault(url: &str) -> Vault {
+    let mut config = serde_json::Map::new();
+    config.insert("database".into(), json!("jaynotes"));
+    config.insert("username".into(), json!("jay"));
+    Vault {
+        id: "dest-tl".into(),
+        name: "Dest server".into(),
+        path: url.to_string(),
+        kind: VaultKind::Tinylord,
+        config,
+    }
+}
+
+fn transfer_temp_dir(tag: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "jaynotes-tl-xfer-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// An empty-`items` query response (serves both the connect-only path sync and
+/// a `find_by_path` miss).
+fn empty_query() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({ "items": [], "next_cursor": null }))
+}
+
+/// With no remembered password the destination is locked — the app-free core of
+/// `open_secondary` returns the `"dest-locked"` sentinel WITHOUT any network.
+#[test]
+fn open_secondary_without_password_is_dest_locked() {
+    let vault = tinylord_vault("http://127.0.0.1:1");
+    match super::open_secondary_with_password(&vault, None) {
+        Err(e) => assert_eq!(e, "dest-locked"),
+        Ok(_) => panic!("expected dest-locked without a password"),
+    }
+}
+
+/// The connect-only handle seeds its folder map from a lightweight path sync, so
+/// `scan_tree` (which drives the transfer folder-picker) lists server folders
+/// without an FTS mirror or SSE.
+#[tokio::test]
+async fn connect_only_handle_lists_server_folders() {
+    let server = MockServer::start().await;
+    login_mock().mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/db/jaynotes/collections/folders/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [ { "id": "f1", "created_at": 1, "updated_at": 1,
+                         "doc": { "path": "Archive" } } ],
+            "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/db/jaynotes/collections/notes/query"))
+        .respond_with(empty_query())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/db/jaynotes/collections/attachments/query"))
+        .respond_with(empty_query())
+        .mount(&server)
+        .await;
+
+    let vault = tinylord_vault(&server.uri());
+    let tree = tokio::task::spawn_blocking(move || {
+        let dest = super::open_secondary_with_password(&vault, Some("pw".into())).unwrap();
+        dest.scan_tree()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        tree.children.iter().any(|c| c.is_dir && c.name == "Archive"),
+        "connect-only scan_tree should list the server's folder"
+    );
+}
+
+/// plain → tinylord happy path: the note document and its referenced attachment
+/// document are created on the server with the right shapes, and the source note
+/// is trashed (copy-then-delete).
+#[tokio::test]
+async fn transfer_plain_to_tinylord_creates_docs_and_trashes_source() {
+    let server = MockServer::start().await;
+    login_mock().mount(&server).await;
+
+    // All queries (connect-only path sync + collision/attachment find_by_path
+    // misses) return empty.
+    for coll in ["notes", "folders", "attachments"] {
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/db/jaynotes/collections/{coll}/query")))
+            .respond_with(empty_query())
+            .mount(&server)
+            .await;
+    }
+
+    let png_bytes = vec![0x89u8, b'P', b'N', b'G', 1, 0x0a];
+    let expected_b64 = base64_encode(&png_bytes);
+
+    // The attachment blob document.
+    Mock::given(method("POST"))
+        .and(path("/v1/db/jaynotes/collections/attachments/documents"))
+        .and(body_partial_json(
+            json!({ "path": "attachments/img.png", "bytes_b64": expected_b64 }),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "att1", "created_at": 5, "updated_at": 5,
+            "doc": { "path": "attachments/img.png" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The note document (link unchanged — attachment kept its original name).
+    Mock::given(method("POST"))
+        .and(path("/v1/db/jaynotes/collections/notes/documents"))
+        .and(body_partial_json(json!({
+            "path": "secret.md",
+            "title": "secret",
+            "content": "# Passwords\n\n![shot](attachments/img.png)\n"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "note1", "created_at": 6, "updated_at": 6,
+            "doc": { "path": "secret.md" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let src = transfer_temp_dir("happy");
+    std::fs::write(
+        src.join("secret.md"),
+        "# Passwords\n\n![shot](attachments/img.png)\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(src.join("attachments")).unwrap();
+    std::fs::write(src.join("attachments/img.png"), &png_bytes).unwrap();
+
+    let vault = tinylord_vault(&server.uri());
+    let src2 = src.clone();
+    let rel = tokio::task::spawn_blocking(move || {
+        let dest = super::open_secondary_with_password(&vault, Some("pw".into())).unwrap();
+        let source = PlainHandle::new(&src2.canonicalize().unwrap());
+        let src_state = AppState::default();
+        transfer_core(&source, &src_state, dest.as_ref(), "secret.md", "")
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(rel, "secret.md");
+    // Source note trashed; source attachment kept.
+    assert!(!src.join("secret.md").is_file(), "source note trashed");
+    assert!(src.join("attachments/img.png").is_file(), "source attachment kept");
+    std::fs::remove_dir_all(&src).ok();
+    // `.expect(1)` on both document mocks is verified when `server` drops.
+}
+
+/// A name clash on the server (`find_by_path` finds an existing note) aborts the
+/// transfer before any mutation: an "already exists" error and the source note
+/// untouched.
+#[tokio::test]
+async fn transfer_collision_on_server_keeps_source() {
+    let server = MockServer::start().await;
+    login_mock().mount(&server).await;
+
+    // find_by_path(notes, "note.md") → an existing document (collision).
+    Mock::given(method("POST"))
+        .and(path("/v1/db/jaynotes/collections/notes/query"))
+        .and(body_partial_json(json!({ "filter": { "path": "note.md" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [ { "id": "existing", "created_at": 1, "updated_at": 1,
+                         "doc": { "path": "note.md", "content": "theirs" } } ],
+            "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+    // Everything else (the connect-only path sync) → empty.
+    for coll in ["notes", "folders", "attachments"] {
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/db/jaynotes/collections/{coll}/query")))
+            .respond_with(empty_query())
+            .mount(&server)
+            .await;
+    }
+    // No document-create mock: a create here would 404 and fail the test.
+
+    let src = transfer_temp_dir("coll");
+    std::fs::write(src.join("note.md"), "source body\n").unwrap();
+
+    let vault = tinylord_vault(&server.uri());
+    let src2 = src.clone();
+    let err = tokio::task::spawn_blocking(move || {
+        let dest = super::open_secondary_with_password(&vault, Some("pw".into())).unwrap();
+        let source = PlainHandle::new(&src2.canonicalize().unwrap());
+        let src_state = AppState::default();
+        transfer_core(&source, &src_state, dest.as_ref(), "note.md", "")
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+
+    assert!(err.contains("already exists"), "got: {err}");
+    assert!(src.join("note.md").is_file(), "source note untouched on collision");
+    std::fs::remove_dir_all(&src).ok();
+}
+
+// ---------------------------------------------------------------------------
 // Full integration against the REAL TinyLord binary (opt-in)
 // ---------------------------------------------------------------------------
 
