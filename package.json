@@ -1,6 +1,6 @@
 {
   "name": "jaynotes",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "JayNotes - a simple Obsidian-style markdown notes desktop app",
   "type": "module",
   "scripts": {
