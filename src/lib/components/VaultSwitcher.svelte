@@ -411,11 +411,18 @@
                   : (f.placeholder ?? "Choose folder…")}
               </button>
             {:else}
+              <!-- Provider config values are credentials/identifiers (salts,
+                   usernames, URLs) — WebKit's auto-capitalize/correct on text
+                   inputs silently corrupts them (wrong key at CREATE time is
+                   unrecoverable), so all OS text assists are disabled. -->
               <input
                 id={`cfg-${f.key}`}
                 class="rename-input"
                 type={f.fieldType === "password" ? "password" : "text"}
                 autocomplete="off"
+                autocapitalize="off"
+                autocorrect="off"
+                spellcheck={false}
                 placeholder={f.placeholder ?? ""}
                 bind:value={configValues[f.key]}
                 onkeydown={(e) => {

@@ -126,6 +126,8 @@
       type="text"
       spellcheck="false"
       autocomplete="off"
+      autocapitalize="off"
+      autocorrect="off"
       placeholder="https://…/v1"
       bind:value={baseUrl}
     />
@@ -151,6 +153,8 @@
         type="text"
         spellcheck="false"
         autocomplete="off"
+        autocapitalize="off"
+        autocorrect="off"
         list="ai-model-list"
         placeholder="e.g. gpt-4o-mini"
         bind:value={model}

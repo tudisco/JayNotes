@@ -749,11 +749,17 @@
                             bind:value={tUnlockPw}
                           />
                           {#if transferTarget?.kind === "encrypted-files"}
+                            <!-- Visible text on purpose (typos must be seeable), but the OS
+                                 must never "help": WebKit auto-capitalizes text inputs, which
+                                 silently derives the wrong key. -->
                             <input
                               class="move-filter"
                               type="text"
                               placeholder="Salt / second password (optional)"
                               autocomplete="off"
+                              autocapitalize="off"
+                              autocorrect="off"
+                              spellcheck={false}
                               bind:value={tUnlockPw2}
                             />
                           {/if}
@@ -933,10 +939,15 @@
           bind:value={unlockPassword}
         />
         {#if $activeVault.kind === "encrypted-files"}
+          <!-- Visible text on purpose, but WebKit auto-capitalization silently
+               derives the wrong key — disable every OS text "assist". -->
           <input
             class="unlock-input"
             type="text"
             autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck={false}
             placeholder="Salt / second password (optional)"
             bind:value={unlockPassword2}
           />
