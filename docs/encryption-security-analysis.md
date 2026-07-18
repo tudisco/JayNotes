@@ -233,3 +233,47 @@ length/close marker (kills silent truncation) and pass the filename as AEAD asso
 content-swap). Both are cheap cryptographically. Neither is possible without abandoning rclone
 interoperability — which is this format's entire reason for existing — so they belong in a deliberately
 *non*-rclone "JayNotes-native" mode, if ever, not in the compatible path.
+
+## 8. Appendix: what about quantum computers?
+
+Short answer for the worried reader: **this design is already in good shape against quantum
+attack — better shape, in fact, than most of the systems around it.**
+
+The reason is structural. Quantum computers threaten two very different classes of cryptography
+very differently:
+
+- **Shor's algorithm** breaks *public-key* cryptography (RSA, elliptic curves, Diffie–Hellman)
+  outright. A cryptographically relevant quantum computer would recover those private keys in
+  polynomial time. This is the real quantum apocalypse — and it is entirely about asymmetric crypto.
+- **Grover's algorithm** merely *square-roots* the brute-force cost of *symmetric* cryptography:
+  a 256-bit key falls from 2²⁵⁶ to ~2¹²⁸ effective operations. 2¹²⁸ remains far beyond physical
+  feasibility, and Grover's speedup is serial by nature (it parallelizes badly and the quantum
+  circuit must run scrypt/XSalsa20 inside it), so real-world gains are smaller still. NIST's own
+  guidance treats AES-256-class symmetric crypto as post-quantum secure.
+
+**rclone-crypt contains no public-key cryptography at all.** Every primitive in the stack —
+XSalsa20-Poly1305 (256-bit key), AES-256-EME for names, scrypt's 256-bit outputs, and SQLCipher's
+AES-256 for the index — is symmetric with 256-bit keys. There is nothing here for Shor to attack.
+The whole construction sits in the Grover-only category, where 256-bit keys were chosen (by the
+NaCl and AES designers) precisely to leave a comfortable margin.
+
+Two honest caveats:
+
+1. **The passphrase remains the weak link, quantum or not.** Grover also square-roots password
+   guessing: a passphrase with ~80 bits of entropy behaves like ~40 against an idealized quantum
+   guesser running scrypt in superposition (impractical today, but that is the model). The fix is
+   the same as recommendation #2 above — a long passphrase. Six-plus random diceware words
+   (~77 bits classical, ~2³⁸ quantum-adjusted guesses *through scrypt each time*) keeps even the
+   theoretical attack absurd; eight words removes the conversation entirely.
+2. **The transport around the vault is the actual quantum exposure, not the vault.** Syncthing's
+   TLS and any HTTPS to a TinyLord server use classical elliptic-curve key exchange today. A
+   "harvest now, decrypt later" adversary recording that traffic could, in a post-quantum future,
+   recover the *session* and read what crossed the wire — but for an encrypted-files vault the
+   payload crossing the wire is *ciphertext with symmetric 256-bit keys*, so even that recovered
+   session reveals only what a disk thief would see. This is an unusual and pleasant property:
+   the at-rest format acts as a post-quantum backstop for its own transport.
+
+**Bottom line:** no changes are needed for quantum resistance, and no post-quantum migration will
+ever be required for the at-rest format itself — symmetric 256-bit crypto is the destination other
+systems are migrating *to*. A user worried about quantum adversaries should spend that worry on
+passphrase length, not on the algorithm.
