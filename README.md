@@ -6,6 +6,8 @@ export, an AI assistant over your notes — and four kinds of vaults, from a
 plain folder of `.md` files to fully encrypted and server-hosted stores.
 Light and dark themes throughout.
 
+![JayNotes](docs/app-screenshot.png)
+
 ## Vault types
 
 | Type | Storage | Best for |
