@@ -31,12 +31,18 @@
   import { $prose as proseComposable } from "@milkdown/kit/utils";
   import { Plugin, PluginKey, type EditorState } from "@milkdown/kit/prose/state";
   import { Decoration, DecorationSet, type EditorView } from "@milkdown/kit/prose/view";
-  import type { Node as ProseNode } from "@milkdown/kit/prose/model";
+  import type { Node as ProseNode, Schema } from "@milkdown/kit/prose/model";
   import { invoke, convertFileSrc } from "@tauri-apps/api/core";
   import { get } from "svelte/store";
   import { vaultPath, vaultError, activeVault } from "$lib/stores/vault";
   import { notifyNoteSaved } from "$lib/stores/indexEvents";
   import { isRelativeUrl } from "$lib/utils/url";
+  import {
+    MAX_TEXT_FILE_BYTES,
+    decodeTextFile,
+    languageForFilename,
+    normalizeText,
+  } from "$lib/utils/textFile";
 
   /** A `[[...]]` run that stays on one line and holds no brackets itself. */
   const WIKILINK_RE = /\[\[[^[\]\n]+?\]\]/g;
@@ -178,6 +184,101 @@
     view.dispatch(tr);
   }
 
+  // ---------------------------------------------------------------------------
+  // Text file support: paste / drag embeds the contents inline
+  //
+  // A dropped `.json` / `.env` / `README.txt` is read as UTF-8 and its contents
+  // go straight into the note as a fenced code block — with a language tag when
+  // the type is recognized, bare otherwise (see `utils/textFile.ts`). Inline
+  // rather than a saved `attachments/` file so the data stays searchable by the
+  // FTS index, greppable, and portable to any other markdown tool — and, in an
+  // encrypted vault, encrypted with the note itself. Binary files are refused:
+  // images are the only file type saved as a real attachment.
+
+  /** Collects non-image files from a clipboard/drag payload. */
+  function extractDataFiles(dt: DataTransfer | null): File[] {
+    if (!dt) return [];
+    return Array.from(dt.files).filter((f) => !f.type.startsWith("image/"));
+  }
+
+  /**
+   * Nodes for one embedded file: a `filename` label paragraph, then the
+   * contents as a code block tagged with the file's language (if known).
+   */
+  function buildTextFileNodes(
+    schema: Schema,
+    fileName: string,
+    raw: string,
+  ): ProseNode[] {
+    const paragraph = schema.nodes.paragraph;
+    const codeBlock = schema.nodes.code_block;
+    if (!paragraph || !codeBlock) return [];
+    const text = normalizeText(raw);
+    const codeMark = schema.marks.inlineCode;
+    return [
+      paragraph.create(
+        null,
+        schema.text(fileName, codeMark ? [codeMark.create()] : undefined),
+      ),
+      codeBlock.create(
+        { language: languageForFilename(fileName) },
+        // `schema.text("")` throws — an empty file gets an empty block.
+        text === "" ? null : schema.text(text),
+      ),
+    ];
+  }
+
+  /** Reads one file as text, or reports why it can't be embedded. */
+  async function readTextFileNodes(
+    schema: Schema,
+    file: File,
+  ): Promise<ProseNode[] | null> {
+    const name = file.name || "pasted-file";
+    if (file.size > MAX_TEXT_FILE_BYTES) {
+      vaultError.set(
+        `'${name}' is too large to embed in a note (${Math.round(file.size / 1024)}KB, limit ${MAX_TEXT_FILE_BYTES / 1024}KB)`,
+      );
+      return null;
+    }
+    let text: string | null;
+    try {
+      text = decodeTextFile(new Uint8Array(await file.arrayBuffer()));
+    } catch (e) {
+      vaultError.set(`Could not read '${name}': ${e}`);
+      return null;
+    }
+    if (text === null) {
+      vaultError.set(
+        `'${name}' isn't a text file — only images and text files can be added to a note`,
+      );
+      return null;
+    }
+    return buildTextFileNodes(schema, name, text);
+  }
+
+  /**
+   * Embeds every readable file in one transaction, so a multi-file drop lands
+   * in the order it was dropped instead of racing on a shared position.
+   */
+  async function insertTextFiles(
+    view: EditorView,
+    files: File[],
+    pos: number | null,
+  ): Promise<void> {
+    const nodes: ProseNode[] = [];
+    for (const file of files) {
+      const built = await readTextFileNodes(view.state.schema, file);
+      if (built) nodes.push(...built);
+    }
+    if (nodes.length === 0) return;
+    const { from, to } = view.state.selection;
+    const tr =
+      pos === null
+        ? view.state.tr.replaceWith(from, to, nodes)
+        : view.state.tr.insert(pos, nodes);
+    view.dispatch(tr);
+  }
+
   const imageDropPasteKey = new PluginKey("jaynotes-image-drop-paste");
 
   const imagePastePlugin = proseComposable(
@@ -186,20 +287,24 @@
         key: imageDropPasteKey,
         props: {
           handlePaste(view: EditorView, event: ClipboardEvent) {
-            const files = extractImageFiles(event.clipboardData);
-            if (files.length === 0) return false;
+            const images = extractImageFiles(event.clipboardData);
+            const texts = extractDataFiles(event.clipboardData);
+            if (images.length === 0 && texts.length === 0) return false;
             event.preventDefault();
-            for (const file of files) void insertImageFile(view, file, null);
+            for (const file of images) void insertImageFile(view, file, null);
+            if (texts.length > 0) void insertTextFiles(view, texts, null);
             return true;
           },
           handleDrop(view: EditorView, event: DragEvent) {
-            const files = extractImageFiles(event.dataTransfer);
-            if (files.length === 0) return false;
+            const images = extractImageFiles(event.dataTransfer);
+            const texts = extractDataFiles(event.dataTransfer);
+            if (images.length === 0 && texts.length === 0) return false;
             event.preventDefault();
             const pos =
               view.posAtCoords({ left: event.clientX, top: event.clientY })
                 ?.pos ?? null;
-            for (const file of files) void insertImageFile(view, file, pos);
+            for (const file of images) void insertImageFile(view, file, pos);
+            if (texts.length > 0) void insertTextFiles(view, texts, pos);
             return true;
           },
         },
@@ -210,6 +315,7 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import { Crepe } from "@milkdown/crepe";
+  import { editorViewCtx } from "@milkdown/kit/core";
   import {
     readNote,
     writeNote,
@@ -416,6 +522,72 @@
   $effect(() => {
     const p = path;
     void switchTo(p);
+  });
+
+  /** The live ProseMirror view, or `null` before the editor finishes building. */
+  function currentView(): EditorView | null {
+    if (!crepe) return null;
+    try {
+      return crepe.editor.ctx.get(editorViewCtx);
+    } catch {
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // File drops from Finder
+  //
+  // `dragDropEnabled: false` in tauri.conf.json hands drag/drop to the webview,
+  // so a Finder drop arrives as a normal DOM DragEvent — but it does not
+  // reliably reach ProseMirror's `handleDrop` prop, which only runs for drops
+  // landing inside the contenteditable and behind Crepe's plugin stack. A
+  // capture-phase listener on the host element runs first and unconditionally,
+  // so it catches drops anywhere in the editor pane. The plugin's `handleDrop`
+  // stays for in-app drags; this handler only claims events carrying files.
+  $effect(() => {
+    const el = host;
+    if (!el) return;
+
+    const carriesFiles = (dt: DataTransfer | null): boolean =>
+      !!dt && Array.from(dt.types).includes("Files");
+
+    // The drop event only fires if dragover is canceled.
+    const onDragOver = (event: DragEvent): void => {
+      if (!carriesFiles(event.dataTransfer)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    };
+
+    const onDrop = (event: DragEvent): void => {
+      const dt = event.dataTransfer;
+      if (!carriesFiles(dt)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const view = currentView();
+      if (!view) return;
+      const images = extractImageFiles(dt);
+      const texts = extractDataFiles(dt);
+      if (images.length === 0 && texts.length === 0) {
+        // The drag advertised files but exposed none — surface it rather than
+        // silently doing nothing, since there's no console in a release build.
+        vaultError.set(
+          `Could not read the dropped file (drag types: ${Array.from(dt?.types ?? []).join(", ") || "none"})`,
+        );
+        return;
+      }
+      const pos =
+        view.posAtCoords({ left: event.clientX, top: event.clientY })?.pos ??
+        null;
+      for (const file of images) void insertImageFile(view, file, pos);
+      if (texts.length > 0) void insertTextFiles(view, texts, pos);
+    };
+
+    el.addEventListener("dragover", onDragOver, true);
+    el.addEventListener("drop", onDrop, true);
+    return () => {
+      el.removeEventListener("dragover", onDragOver, true);
+      el.removeEventListener("drop", onDrop, true);
+    };
   });
 
   // Flush on window blur and when the tab/window is hidden.
